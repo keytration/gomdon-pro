@@ -21,7 +21,9 @@ import {
   AlertTriangle,
   GitMerge,
   CheckSquare,
-  Square
+  Square,
+  Download,
+  FileSpreadsheet
 } from 'lucide-react';
 import type { Shop, WeightStepRule, UserAccount, ReconciliationSession, ShopPricingPlan } from '../types';
 import { calculateWeightFee, detectUnregisteredShopsFromOrders } from '../services/reconciliationService';
@@ -190,6 +192,28 @@ export const ShopManagementView: React.FC<ShopManagementViewProps> = ({
 
   // Weight calculator test
   const [testWeight, setTestWeight] = useState<number>(1.5);
+  const [isExportingDirectory, setIsExportingDirectory] = useState(false);
+
+  // 📤 Xuất danh sách Shop & Bảng giá chi tiết ra Excel
+  const handleExportShopsDirectory = async (targetShops?: Shop[]) => {
+    const listToExport = targetShops && targetShops.length > 0 ? targetShops : (filteredShops.length > 0 ? filteredShops : shops);
+    if (!listToExport || listToExport.length === 0) {
+      showToast('Không có dữ liệu shop nào để xuất Excel', 'warning');
+      return;
+    }
+
+    try {
+      setIsExportingDirectory(true);
+      showToast(`Đang kết xuất thông tin & bảng giá ${listToExport.length} Shop ra Excel...`, 'info');
+      await ExcelService.exportShopsDirectoryExcel(listToExport, activeCarrierName);
+      showToast(`Đã xuất thành công file Excel thông tin & bảng giá ${listToExport.length} Shop!`, 'success');
+    } catch (err: any) {
+      console.error('Error exporting shops directory:', err);
+      showToast(`Lỗi xuất file Excel: ${err?.message || 'Không thể tạo file'}`, 'error');
+    } finally {
+      setIsExportingDirectory(false);
+    }
+  };
 
   // Auto select first shop on initial render
   useEffect(() => {
@@ -1012,6 +1036,32 @@ export const ShopManagementView: React.FC<ShopManagementViewProps> = ({
               HÃNG: {activeCarrierName.toUpperCase()}
             </span>
           )}
+
+          <button
+            type="button"
+            onClick={() => handleExportShopsDirectory()}
+            disabled={isExportingDirectory || shops.length === 0}
+            className="btn btn-secondary btn-sm"
+            style={{
+              padding: '4px 10px',
+              fontSize: 11.5,
+              fontWeight: 700,
+              background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.12) 0%, rgba(5, 150, 105, 0.08) 100%)',
+              color: '#047857',
+              border: '1.5px solid #10b981',
+              borderRadius: 6,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 5,
+              whiteSpace: 'nowrap',
+              boxShadow: '0 1px 3px rgba(16, 185, 129, 0.15)',
+              cursor: isExportingDirectory ? 'wait' : 'pointer',
+            }}
+            title="Xuất toàn bộ danh sách thông tin Shop và Bảng giá cước chi tiết ra Excel"
+          >
+            <FileSpreadsheet size={13} color="#059669" />
+            <span>{isExportingDirectory ? 'Đang xuất...' : `Xuất Excel Shop & Bảng Giá (${shops.length})`}</span>
+          </button>
         </div>
 
         {/* Right: Floating 3D Selected Shop Card */}
@@ -1350,6 +1400,33 @@ export const ShopManagementView: React.FC<ShopManagementViewProps> = ({
                   <span>Gán biểu giá chuẩn</span>
                 </button>
               </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const selectedShops = shops.filter(s => selectedBatchShopIds.includes(s.id));
+                  handleExportShopsDirectory(selectedShops);
+                }}
+                disabled={isExportingDirectory}
+                className="btn btn-secondary btn-sm"
+                style={{
+                  width: '100%',
+                  justifyContent: 'center',
+                  fontSize: 11.5,
+                  fontWeight: 700,
+                  padding: '6px 8px',
+                  background: 'rgba(59, 130, 246, 0.08)',
+                  color: '#1d4ed8',
+                  border: '1px solid #60a5fa',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 5,
+                }}
+                title="Xuất riêng danh sách các shop đang được tick chọn ra Excel"
+              >
+                <Download size={13} />
+                <span>Xuất Excel {selectedBatchShopIds.length} Shop đã chọn</span>
+              </button>
 
               {selectedBatchShopIds.length >= 2 && (() => {
                 const selectedShops = shops.filter(s => selectedBatchShopIds.includes(s.id));
@@ -2108,15 +2185,39 @@ export const ShopManagementView: React.FC<ShopManagementViewProps> = ({
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <Sliders size={15} /> 3. BIỂU GIÁ CƯỚC BẬC THANG RIÊNG THEO CÂN NẶNG
                 </div>
-                <button
-                  type="button"
-                  onClick={handleAddWeightRule}
-                  className="btn btn-secondary btn-sm"
-                  style={{ fontSize: 11, padding: '3px 8px' }}
-                >
-                  <Plus size={13} />
-                  <span>Thêm Nấc Cân Nặng</span>
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <button
+                    type="button"
+                    onClick={() => handleExportShopsDirectory([editingShop])}
+                    disabled={isExportingDirectory}
+                    className="btn btn-secondary btn-sm"
+                    style={{
+                      fontSize: 11,
+                      padding: '3px 9px',
+                      background: 'rgba(16, 185, 129, 0.1)',
+                      color: '#047857',
+                      border: '1px solid #10b981',
+                      fontWeight: 700,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                    }}
+                    title="Xuất bảng giá và thông tin riêng của Shop này ra Excel"
+                  >
+                    <Download size={12} />
+                    <span>Xuất Excel Shop Này</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleAddWeightRule}
+                    className="btn btn-secondary btn-sm"
+                    style={{ fontSize: 11, padding: '3px 8px' }}
+                  >
+                    <Plus size={13} />
+                    <span>Thêm Nấc Cân Nặng</span>
+                  </button>
+                </div>
               </div>
 
               <div style={{

@@ -1,8 +1,24 @@
 import type { ShopSettlementStatement, EmailSettings, ReconciliationSession } from '../types';
-import { StorageService } from './storage';
+import { StorageService, DEFAULT_EMAIL_SETTINGS } from './storage';
 import { getAuthHeaders } from './authService';
 import { ExcelService } from './excelService';
 import * as XLSX from 'xlsx';
+
+/**
+ * Chuẩn hóa tên file đính kèm email thành mã ASCII thuần không dấu và không dấu cách
+ * Tránh triệt để việc bộ lọc Spam/Quảng cáo của Gmail, Yahoo chặn hoặc đánh dấu thư rác
+ */
+export function sanitizeEmailFilename(name: string): string {
+  if (!name) return 'shop';
+  return String(name)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
 
 export const EmailService = {
   formatMoney(amount: number): string {
@@ -58,11 +74,11 @@ export const EmailService = {
     const finalPayout = Math.max(0, netAmount);
     const amountShopOwes = Math.max(0, -netAmount);
 
-    let subject = settings.subjectTemplate;
-    let body = settings.bodyTemplate;
+    let subject = settings?.subjectTemplate || DEFAULT_EMAIL_SETTINGS.subjectTemplate;
+    let body = settings?.bodyTemplate || DEFAULT_EMAIL_SETTINGS.bodyTemplate;
 
     // Check Carrier Specific Template
-    if (carrierId && settings.carrierTemplates && settings.carrierTemplates[carrierId]) {
+    if (carrierId && settings?.carrierTemplates && settings.carrierTemplates[carrierId]) {
       const cTemplate = settings.carrierTemplates[carrierId];
       if (cTemplate.subjectTemplate) subject = cTemplate.subjectTemplate;
       if (cTemplate.bodyTemplate) body = cTemplate.bodyTemplate;
@@ -94,17 +110,17 @@ export const EmailService = {
     }
 
     const replacements: Record<string, string> = {
-      '{TEN_SHOP}': statement.shopName,
-      '{MA_SHOP}': statement.shopCode,
-      '{KY_DOI_SOAT}': statement.periodName,
-      '{TONG_DON}': statement.totalOrders.toLocaleString('vi-VN'),
+      '{TEN_SHOP}': statement.shopName || '',
+      '{MA_SHOP}': statement.shopCode || '',
+      '{KY_DOI_SOAT}': statement.periodName || '',
+      '{TONG_DON}': (statement.totalOrders || 0).toLocaleString('vi-VN'),
       '{DON_THANH_CONG}': (statement.deliveredOrders || 0).toLocaleString('vi-VN'),
       '{DON_GUI}': ((statement.shippingOrders || statement.totalOrders) || 0).toLocaleString('vi-VN'),
       '{DON_HOAN}': (statement.returnedOrders || 0).toLocaleString('vi-VN'),
-      '{TONG_COD}': this.formatMoney(statement.totalCod),
+      '{TONG_COD}': this.formatMoney(statement.totalCod || 0),
       '{TONG_CUOC}': this.formatMoney(totalAllFee),
-      '{CUOC_GUI}': this.formatMoney(statement.totalShopFee),
-      '{PHI_KHAC}': this.formatMoney(statement.totalShopOtherFee),
+      '{CUOC_GUI}': this.formatMoney(statement.totalShopFee || 0),
+      '{PHI_KHAC}': this.formatMoney(statement.totalShopOtherFee || 0),
       '{THUC_TRA}': thucTraStr,
       '{CONG_NO_DAU_KY}': openingDebtStr,
       '{SHOP_CON_NO}': this.formatMoney(amountShopOwes),
@@ -112,14 +128,15 @@ export const EmailService = {
       '{GHI_CHU_NO}': debtNoteStr,
       '{NGAN_HANG}': statement.bankInfo?.bankName || 'Chưa cập nhật',
       '{SO_TAI_KHOAN}': statement.bankInfo?.accountNumber || 'Chưa cập nhật',
-      '{CHU_TAI_KHOAN}': statement.bankInfo?.accountHolder || statement.shopName,
+      '{CHU_TAI_KHOAN}': statement.bankInfo?.accountHolder || statement.shopName || '',
       '{SDT_SHOP}': statement.shopPhone || '',
       '{EMAIL_SHOP}': statement.shopEmail || '',
     };
 
     for (const [key, value] of Object.entries(replacements)) {
-      subject = subject.split(key).join(value);
-      body = body.split(key).join(value);
+      const safeVal = String(value ?? '');
+      subject = String(subject || '').split(key).join(safeVal);
+      body = String(body || '').split(key).join(safeVal);
     }
 
     return { subject, body };
@@ -131,7 +148,7 @@ export const EmailService = {
     const amountShopOwes = Math.max(0, -((statement.totalNetPayout || 0) + previousDebtVal));
 
     const companyInfo = StorageService.getCompanyInfo();
-    const companyName = companyInfo?.companyName || settings.senderName || 'CÔNG TY LOGISTICS & GOM ĐƠN';
+    const companyName = companyInfo?.companyName || settings?.senderName || 'CÔNG TY LOGISTICS & GOM ĐƠN';
     const companyAddress = companyInfo?.address || '';
     const companyPhone = companyInfo?.phone || '';
     const companyTax = companyInfo?.taxCode || '';
@@ -139,8 +156,8 @@ export const EmailService = {
     // Dynamically render custom text body from user settings template (carrier specific or general)
     const { body: customTextBody } = this.renderEmail(statement, settings, carrierId, _session);
 
-    const totalCodStr = this.formatMoney(statement.totalCod);
-    const totalFeeStr = this.formatMoney(statement.totalShopFee + statement.totalShopOtherFee);
+    const totalCodStr = this.formatMoney(statement.totalCod || 0);
+    const totalFeeStr = this.formatMoney((statement.totalShopFee || 0) + (statement.totalShopOtherFee || 0));
     const netPayoutStr = this.formatMoney(finalPayout);
     const openingDebtStr = previousDebtVal < 0 
       ? `-${this.formatMoney(Math.abs(previousDebtVal))}` 
@@ -203,10 +220,10 @@ export const EmailService = {
                       📦 Tổng Sản Lượng
                     </div>
                     <div style="font-size: 20px; font-weight: 800; color: #0f172a;">
-                      ${statement.totalOrders.toLocaleString('vi-VN')} <span style="font-size: 13px; font-weight: 500; color: #64748b;">đơn</span>
+                      ${(statement.totalOrders || 0).toLocaleString('vi-VN')} <span style="font-size: 13px; font-weight: 500; color: #64748b;">đơn</span>
                     </div>
                     <div style="font-size: 11.5px; color: #16a34a; margin-top: 4px;">
-                      ✓ Hoàn COD: <strong>${statement.deliveredOrders || 0}</strong> • Tính cước: <strong>${statement.shippingOrders !== undefined ? statement.shippingOrders : (statement.orders.filter(o => ((o.shopCalculatedFee || 0) + (o.shopOtherFee || 0) > 0) || (o.nvcBaseFee || 0) > 0).length)}</strong> • Hoàn: <strong>${statement.returnedOrders || 0}</strong>
+                      ✓ Hoàn COD: <strong>${statement.deliveredOrders || 0}</strong> • Tính cước: <strong>${statement.shippingOrders !== undefined ? statement.shippingOrders : ((statement.orders || []).filter(o => ((o.shopCalculatedFee || 0) + (o.shopOtherFee || 0) > 0) || (o.nvcBaseFee || 0) > 0).length)}</strong> • Hoàn: <strong>${statement.returnedOrders || 0}</strong>
                     </div>
                   </td>
 
@@ -330,15 +347,15 @@ export const EmailService = {
                     <table width="100%" border="0" cellspacing="0" cellpadding="4" style="font-size: 13.5px; color: #475569;">
                       <tr>
                         <td width="130" style="color: #64748b;">Ngân hàng:</td>
-                        <td><strong style="color: #0f172a;">${statement.bankInfo.bankName || 'Chưa cập nhật'}</strong></td>
+                        <td><strong style="color: #0f172a;">${statement.bankInfo?.bankName || 'Chưa cập nhật'}</strong></td>
                       </tr>
                       <tr>
                         <td style="color: #64748b;">Số tài khoản:</td>
-                        <td><strong style="color: #4f46e5; font-size: 15px; font-family: monospace;">${statement.bankInfo.accountNumber || 'Chưa cập nhật'}</strong></td>
+                        <td><strong style="color: #4f46e5; font-size: 15px; font-family: monospace;">${statement.bankInfo?.accountNumber || 'Chưa cập nhật'}</strong></td>
                       </tr>
                       <tr>
                         <td style="color: #64748b;">Chủ tài khoản:</td>
-                        <td><strong style="color: #0f172a; text-transform: uppercase;">${statement.bankInfo.accountHolder || statement.shopName}</strong></td>
+                        <td><strong style="color: #0f172a; text-transform: uppercase;">${statement.bankInfo?.accountHolder || statement.shopName || ''}</strong></td>
                       </tr>
                     </table>
                   </td>
@@ -430,6 +447,25 @@ export const EmailService = {
     }
   },
 
+  getAttachmentFilename(statement: { shopCode?: string; shopName?: string }): string {
+    const code = sanitizeEmailFilename(statement.shopCode || '');
+    const name = sanitizeEmailFilename(statement.shopName || '');
+    const tag = code || name || 'shop';
+    return `Bang_ke_doi_soat_${tag}.xlsx`;
+  },
+
+  async getEmailLogs(limit = 100): Promise<Array<any>> {
+    try {
+      const response = await fetch(`/api/email-logs?limit=${limit}`, {
+        headers: getAuthHeaders(),
+      });
+      const data = await response.json();
+      return data.success && Array.isArray(data.logs) ? data.logs : [];
+    } catch {
+      return [];
+    }
+  },
+
   async sendRealEmail(params: {
     senderName: string;
     senderEmail: string;
@@ -492,7 +528,7 @@ export const EmailService = {
         const excelBase64 = this.generateExcelBase64(stmt);
         if (excelBase64) {
           attachments.push({
-            filename: `Bang_ke_doi_soat_${stmt.shopCode || stmt.shopName}.xlsx`,
+            filename: this.getAttachmentFilename(stmt),
             content: excelBase64,
           });
         }

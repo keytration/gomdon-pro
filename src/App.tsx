@@ -8,6 +8,8 @@ import { HistoryAndAnalyticsView } from './components/HistoryAndAnalyticsView';
 import { DebtAndPayoutView } from './components/DebtAndPayoutView';
 import { DataAuditView } from './components/DataAuditView';
 import { CtvManagementView } from './components/CtvManagementView';
+import { DailyAdvanceManagementView } from './components/DailyAdvanceManagementView';
+import { OrderLossTrackingTab } from './components/OrderLossTrackingTab';
 import { LoginView } from './components/LoginView';
 import { BackupModal } from './components/BackupModal';
 import { CompanySettingsModal } from './components/CompanySettingsModal';
@@ -65,7 +67,12 @@ export function App() {
       if (ch === 'zalo' || ch === 'email' || ch === 'telegram') channel = ch;
     }
 
-    return { carrierId, tab, channel };
+    let sessionId: string | null = null;
+    if (search.has('session_id')) {
+      sessionId = search.get('session_id');
+    }
+
+    return { carrierId, tab, channel, sessionId };
   };
 
   const initialRoute = parseAppRoute();
@@ -84,6 +91,7 @@ export function App() {
   const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
   const [isCompanyModalOpen, setIsCompanyModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<any>(undefined);
   const [isScreenLocked, setIsScreenLocked] = useState<boolean>(() => {
     return localStorage.getItem('gomdon_is_locked') === 'true';
   });
@@ -198,6 +206,11 @@ export function App() {
       setActiveCarrierId(route.carrierId);
       setActiveTab(route.tab);
       setReportsChannel(route.channel);
+      if (route.sessionId) {
+        void StorageService.getSessionDetail(route.sessionId, true).then(full => {
+          if (full) setCurrentSession(full);
+        });
+      }
     };
 
     window.addEventListener('popstate', handlePopState);
@@ -292,9 +305,20 @@ export function App() {
     const synced = await StorageService.syncWithServer();
     setShops(StorageService.getShops());
     setCarriers(StorageService.getCarriers());
-    setSessions(StorageService.getSessions());
+    const refreshedSessions = StorageService.getSessions();
+    setSessions(refreshedSessions);
     setEmailSettings(StorageService.getEmailSettings());
     setDataConnection(synced ? 'connected' : 'offline');
+
+    // 3. 🎯 Nếu có session_id trong URL, luôn nạp bản ghi đầy đủ, mới nhất từ máy chủ
+    const currentParams = new URLSearchParams(window.location.search);
+    const targetSessionId = currentParams.get('session_id') || initialRoute.sessionId;
+    if (targetSessionId) {
+      const full = await StorageService.getSessionDetail(targetSessionId, true);
+      if (full) {
+        setCurrentSession(full);
+      }
+    }
   };
 
   const handleLogout = () => {
@@ -516,11 +540,12 @@ export function App() {
           {/* Settings Modal — Cài đặt & Hướng dẫn sử dụng on Hub */}
           <SettingsModal
             isOpen={isSettingsModalOpen}
-            onClose={() => setIsSettingsModalOpen(false)}
+            onClose={() => { setIsSettingsModalOpen(false); setSettingsInitialTab(undefined); }}
             userRole={currentUser.role}
             currentUser={currentUser}
             onSaved={loadAllData}
             onNavigateTo={(tab) => { setActiveTab(tab); setIsSettingsModalOpen(false); }}
+            initialTab={settingsInitialTab}
           />
 
           {/* Security Anti-Screenshot Watermark Overlay */}
@@ -596,6 +621,8 @@ export function App() {
             </span>
             <span>/</span>
             {activeTab === 'reconciliation' && <span style={{ fontWeight: 700, color: 'var(--text-main)' }}>Đối Soát Kéo Thả</span>}
+            {activeTab === 'daily_advances' && <span style={{ fontWeight: 700, color: 'var(--text-main)' }}>Quản Lý Ứng COD Hàng Ngày (T+0)</span>}
+            {activeTab === 'loss_tracking' && <span style={{ fontWeight: 700, color: 'var(--text-main)' }}>Quản Lý Đơn Hàng ({activeCarrierObj.carrierName})</span>}
             {activeTab === 'shops' && <span style={{ fontWeight: 700, color: 'var(--text-main)' }}>Shop & Biểu Phí</span>}
             {activeTab === 'debt' && <span style={{ fontWeight: 700, color: 'var(--text-main)' }}>Công Nợ & Đi Tiền Bank</span>}
             {activeTab === 'audit' && <span style={{ fontWeight: 700, color: 'var(--text-main)' }}>Rà Soát Dữ Liệu</span>}
@@ -768,6 +795,28 @@ export function App() {
                 }}
               />
             </div>
+
+            {activeTab === 'daily_advances' && (
+              <DailyAdvanceManagementView
+                currentUser={currentUser}
+                activeCarrierId={activeCarrierId}
+                activeCarrierName={activeCarrierObj.carrierName}
+                shops={carrierShops}
+              />
+            )}
+
+            {activeTab === 'loss_tracking' && (
+              <OrderLossTrackingTab
+                currentUser={currentUser}
+                activeCarrierId={activeCarrierId}
+                activeCarrierName={activeCarrierObj.carrierName}
+                shops={carrierShops}
+                onOpenSettings={() => {
+                  setSettingsInitialTab('sla_tracking');
+                  setIsSettingsModalOpen(true);
+                }}
+              />
+            )}
 
             {activeTab === 'shops' && (
               <ShopManagementView
@@ -1024,11 +1073,12 @@ export function App() {
       {/* Settings Modal — Cài đặt & Hướng dẫn sử dụng */}
       <SettingsModal
         isOpen={isSettingsModalOpen}
-        onClose={() => setIsSettingsModalOpen(false)}
+        onClose={() => { setIsSettingsModalOpen(false); setSettingsInitialTab(undefined); }}
         userRole={currentUser.role}
         currentUser={currentUser}
         onSaved={loadAllData}
         onNavigateTo={(tab) => { setActiveTab(tab); setIsSettingsModalOpen(false); }}
+        initialTab={settingsInitialTab}
       />
 
       {/* Security Anti-Screenshot Watermark Overlay */}

@@ -7,12 +7,16 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Node dependencies
 node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+!.env.example
 
-# Editor directories and files
+# Editor & OS files
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -25,4 +29,19 @@ dist-ssr
 
 # Runtime Data Storage & Backups
 data/
+outputs/
+*.backup
+*.enc
+*.zip
 
+# Standalone Build Artifacts
+build/
+dist-bin/
+
+# Temporary / Internal Debugging Scripts & Agents
+.agents/
+check_export_fee.sh
+fix_session_31.sh
+inspect_session_31.sh
+test_vps.sh
+recalculate_remote.cjs

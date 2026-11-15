@@ -22,11 +22,12 @@ import {
   Sparkles,
   MessageSquare,
   Search,
+  History,
 } from 'lucide-react';
 import type { ReconciliationSession, EmailSettings, ShopSettlementStatement, ZaloZnsSettings, TelegramSettings } from '../types';
 import { EmailService } from '../services/emailService';
 import { ExcelService } from '../services/excelService';
-import { StorageService } from '../services/storage';
+import { StorageService, DEFAULT_EMAIL_SETTINGS } from '../services/storage';
 import { ZaloZnsService } from '../services/zaloZnsService';
 import { TelegramService } from '../services/telegramService';
 import { calculateStatementSettlement, calculateLiveOpeningDebtForStatement, getStatementPaidAmount, getStatementCollectedAmount, getStatementDebtAddedAmount, isShopMatching } from '../services/settlementService';
@@ -166,7 +167,12 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
 
   const hasUnmatchedOrders = (activeSession?.unmatchedOrdersCount || 0) > 0;
 
-  const [settings, setSettings] = useState<EmailSettings>(emailSettings);
+  const [settings, setSettings] = useState<EmailSettings>(() => ({
+    ...DEFAULT_EMAIL_SETTINGS,
+    ...emailSettings,
+    subjectTemplate: emailSettings?.subjectTemplate || DEFAULT_EMAIL_SETTINGS.subjectTemplate,
+    bodyTemplate: emailSettings?.bodyTemplate || DEFAULT_EMAIL_SETTINGS.bodyTemplate,
+  }));
 
   // Active Notification Channel: 'zalo' | 'email' | 'telegram'
   const [activeChannel, setActiveChannel] = useState<'zalo' | 'email' | 'telegram'>(initialChannel);
@@ -208,6 +214,29 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
   const [shopStatuses, setShopStatuses] = useState<Record<string, { status: 'idle' | 'sending' | 'sent' | 'failed'; message?: string }>>({});
   const [copiedBody, setCopiedBody] = useState(false);
 
+  // Email Audit Logs Modal State
+  const [isLogsModalOpen, setIsLogsModalOpen] = useState(false);
+  const [emailLogs, setEmailLogs] = useState<Array<any>>([]);
+  const [isLoadingLogs, setIsLoadingLogs] = useState(false);
+
+  const fetchEmailLogs = async () => {
+    try {
+      setIsLoadingLogs(true);
+      const logs = await EmailService.getEmailLogs(100);
+      setEmailLogs(logs);
+    } catch {
+      // Ignored
+    } finally {
+      setIsLoadingLogs(false);
+    }
+  };
+
+  React.useEffect(() => {
+    if (activeChannel === 'email') {
+      fetchEmailLogs();
+    }
+  }, [activeChannel]);
+
   // Sending Delay Interval State (Anti-spam / Rate limiting)
   const [sendIntervalSec, setSendIntervalSec] = useState<number>(2);
 
@@ -246,13 +275,13 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
   ];
 
   // Helper to get active subject and body template for selected carrier tab
-  const activeSubject = selectedCarrierTab === 'default'
+  const activeSubject = (selectedCarrierTab === 'default'
     ? settings.subjectTemplate
-    : (settings.carrierTemplates?.[selectedCarrierTab]?.subjectTemplate || settings.subjectTemplate);
+    : (settings.carrierTemplates?.[selectedCarrierTab]?.subjectTemplate || settings.subjectTemplate)) || DEFAULT_EMAIL_SETTINGS.subjectTemplate;
 
-  const activeBody = selectedCarrierTab === 'default'
+  const activeBody = (selectedCarrierTab === 'default'
     ? settings.bodyTemplate
-    : (settings.carrierTemplates?.[selectedCarrierTab]?.bodyTemplate || settings.bodyTemplate);
+    : (settings.carrierTemplates?.[selectedCarrierTab]?.bodyTemplate || settings.bodyTemplate)) || DEFAULT_EMAIL_SETTINGS.bodyTemplate;
 
   const handleUpdateActiveSubject = (val: string) => {
     if (selectedCarrierTab === 'default') {
@@ -460,7 +489,7 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
         text: body,
         html: htmlBody,
         attachments: excelBase64 ? [{
-          filename: `Bang_ke_doi_soat_${stmt.shopCode || stmt.shopName}.xlsx`,
+          filename: EmailService.getAttachmentFilename(stmt),
           content: excelBase64,
         }] : undefined,
       });
@@ -480,6 +509,7 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
     }
 
     setIsSendingBatch(false);
+    fetchEmailLogs();
     showToast('Đã hoàn tất tiến trình gửi email đối soát hàng loạt!', 'success');
   };
 
@@ -1895,6 +1925,21 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
             </select>
           </div>
 
+          {/* Email History Logs Button */}
+          <button
+            type="button"
+            onClick={() => {
+              fetchEmailLogs();
+              setIsLogsModalOpen(true);
+            }}
+            className="btn btn-secondary btn-sm"
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', fontWeight: 700, fontSize: 12 }}
+            title="Xem nhật ký lịch sử các email đối soát đã gửi và mã phản hồi Google"
+          >
+            <History size={14} color="var(--primary)" />
+            <span>Lịch Sử Gửi Mail ({emailLogs.length})</span>
+          </button>
+
           {/* Schedule Email Button */}
           <button
             type="button"
@@ -1936,6 +1981,45 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
               </>
             )}
           </button>
+        </div>
+      </div>
+
+      {/* 💡 HƯỚNG DẪN XỬ LÝ KHI SHOP BÁO CHƯA THẤY EMAIL */}
+      <div style={{
+        background: 'linear-gradient(180deg, #eff6ff 0%, #f0fdf4 100%)',
+        border: '1.5px solid #bfdbfe',
+        borderRadius: 14,
+        padding: '12px 18px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+        boxShadow: '0 2px 8px rgba(59, 130, 246, 0.05)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#1e40af', fontWeight: 800, fontSize: 13 }}>
+            <AlertCircle size={16} color="#2563eb" />
+            <span>HƯỚNG DẪN XỬ LÝ KHI SHOP BÁO KHÔNG NHẬN ĐƯỢC EMAIL:</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              fetchEmailLogs();
+              setIsLogsModalOpen(true);
+            }}
+            className="btn btn-sm"
+            style={{ background: '#ffffff', border: '1px solid #bfdbfe', color: '#1d4ed8', display: 'flex', alignItems: 'center', gap: 6, padding: '4px 10px', fontSize: 11.5, fontWeight: 700, borderRadius: 8 }}
+          >
+            <History size={13} />
+            <span>Xem Nhật Ký Đã Gửi ({emailLogs.length})</span>
+          </button>
+        </div>
+        <div style={{ fontSize: 12, color: '#334155', lineHeight: 1.6 }}>
+          <p style={{ margin: '2px 0' }}>
+            1. <strong>Kiểm tra thư mục Thư rác (Spam) hoặc Quảng cáo (Promotions):</strong> Do email đối soát chứa file bảng kê Excel <code>.xlsx</code> và thông tin thanh toán tiền COD/cước phí, bộ lọc của Gmail thường tự động phân loại thư vào mục <strong>"Thư rác" (Spam)</strong> hoặc <strong>"Quảng cáo"</strong>. Hãy báo chủ shop vào mục này và bấm <strong>"Báo cáo không phải thư rác" (Not Spam)</strong> để các kỳ sau thư sẽ về thẳng Hộp thư đến chính.
+          </p>
+          <p style={{ margin: '2px 0' }}>
+            2. <strong>Kiểm tra tại Gmail người gửi:</strong> Bạn có thể đăng nhập vào hòm thư Gmail gửi (<strong>{settings.senderEmail || 'Gmail gửi của bạn'}</strong>) và mở mục <strong>"Thư đã gửi" (Sent)</strong> để kiểm chứng Google đã phát thư thành công.
+          </p>
         </div>
       </div>
 
@@ -2579,13 +2663,14 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
                               text: body,
                               html: htmlBody,
                               attachments: excelBase64 ? [{
-                                filename: `Bang_ke_doi_soat_${stmt.shopCode || stmt.shopName}.xlsx`,
+                                filename: EmailService.getAttachmentFilename(stmt),
                                 content: excelBase64,
                               }] : undefined,
                             });
                             if (res.success) {
                               setShopStatuses(prev => ({ ...prev, [stmt.shopId]: { status: 'sent', message: `Đã gửi thành công tới ${recipientEmails.length} mail` } }));
                               showToast(`Đã gửi mail thành công cho ${stmt.shopName}!`, 'success');
+                              fetchEmailLogs();
                             } else {
                               setShopStatuses(prev => ({ ...prev, [stmt.shopId]: { status: 'failed', message: res.error } }));
                               showToast(`Gửi thất bại cho ${stmt.shopName}: ${res.error}`, 'error');
@@ -2789,6 +2874,183 @@ export const BulkEmailView: React.FC<BulkEmailViewProps> = ({
                 </div>
               </div>
 
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 📜 MODAL LỊCH SỬ GỬI EMAIL ĐỐI SOÁT */}
+      {isLogsModalOpen && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(15, 23, 42, 0.65)',
+          backdropFilter: 'blur(4px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 9999,
+          padding: 16,
+        }}>
+          <div style={{
+            background: '#ffffff',
+            borderRadius: 16,
+            width: '100%',
+            maxWidth: 960,
+            maxHeight: '90vh',
+            display: 'flex',
+            flexDirection: 'column',
+            boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
+            border: '1.5px solid #cbd5e1',
+            overflow: 'hidden',
+          }}>
+            {/* Modal Header */}
+            <div style={{
+              padding: '16px 20px',
+              borderBottom: '1.5px solid #e2e8f0',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              background: 'linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%)',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{
+                  width: 34,
+                  height: 34,
+                  borderRadius: 8,
+                  background: 'linear-gradient(135deg, #4f46e5 0%, #06b6d4 100%)',
+                  color: '#fff',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}>
+                  <History size={18} />
+                </div>
+                <div>
+                  <h3 style={{ fontSize: 16, fontWeight: 800, color: '#0f172a', margin: 0 }}>
+                    Nhật Ký & Lịch Sử Gửi Email Đối Soát
+                  </h3>
+                  <p style={{ fontSize: 11.5, color: '#64748b', margin: '2px 0 0' }}>
+                    Dữ liệu kiểm chứng thời gian thực từ Google SMTP Server ({emailLogs.length} bản ghi gần nhất)
+                  </p>
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={fetchEmailLogs}
+                  disabled={isLoadingLogs}
+                  className="btn btn-secondary btn-sm"
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 700 }}
+                >
+                  <RotateCcw size={13} className={isLoadingLogs ? 'animate-spin' : ''} />
+                  <span>Làm mới</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsLogsModalOpen(false)}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: '#64748b',
+                    cursor: 'pointer',
+                    padding: 6,
+                    borderRadius: 6,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <X size={20} />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body */}
+            <div style={{ padding: '16px 20px', overflowY: 'auto', flex: 1 }}>
+              {emailLogs.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '48px 20px', color: '#94a3b8' }}>
+                  <Mail size={40} style={{ margin: '0 auto 12px', opacity: 0.5 }} />
+                  <p style={{ fontSize: 14, fontWeight: 600 }}>Chưa có nhật ký gửi email nào được ghi lại.</p>
+                  <p style={{ fontSize: 12 }}>Các email gửi qua SMTP Google sẽ tự động xuất hiện tại đây.</p>
+                </div>
+              ) : (
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ background: '#f8fafc', borderBottom: '2px solid #e2e8f0', color: '#475569', textAlign: 'left' }}>
+                        <th style={{ padding: '10px 12px', fontWeight: 800 }}>Thời gian</th>
+                        <th style={{ padding: '10px 12px', fontWeight: 800 }}>Người nhận (To)</th>
+                        <th style={{ padding: '10px 12px', fontWeight: 800 }}>Tiêu đề</th>
+                        <th style={{ padding: '10px 12px', fontWeight: 800 }}>File đính kèm</th>
+                        <th style={{ padding: '10px 12px', fontWeight: 800 }}>Trạng thái</th>
+                        <th style={{ padding: '10px 12px', fontWeight: 800 }}>Mã phản hồi Google</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {emailLogs.map((log: any, idx: number) => (
+                        <tr key={log.id || idx} style={{ borderBottom: '1px solid #f1f5f9', background: idx % 2 === 0 ? '#ffffff' : '#fafafa' }}>
+                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap', color: '#334155', fontWeight: 600 }}>
+                            {log.timestamp ? new Date(log.timestamp).toLocaleString('vi-VN') : '—'}
+                          </td>
+                          <td style={{ padding: '10px 12px', color: '#0f172a', fontWeight: 700 }}>
+                            {log.to}
+                          </td>
+                          <td style={{ padding: '10px 12px', color: '#334155', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.subject}>
+                            {log.subject || '—'}
+                          </td>
+                          <td style={{ padding: '10px 12px', color: '#475569', fontSize: 11 }}>
+                            {log.attachments && log.attachments.length > 0 ? (
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: '#f0fdf4', color: '#166534', padding: '2px 6px', borderRadius: 4, border: '1px solid #bbf7d0', fontWeight: 600 }}>
+                                <FileSpreadsheet size={12} />
+                                {log.attachments.join(', ')}
+                              </span>
+                            ) : (
+                              <span style={{ color: '#94a3b8' }}>Không</span>
+                            )}
+                          </td>
+                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>
+                            {log.status === 'sent' ? (
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: '#dcfce7', color: '#15803d', padding: '3px 8px', borderRadius: 6, fontWeight: 800, fontSize: 11 }}>
+                                <CheckCircle2 size={12} /> Đã gửi (200 OK)
+                              </span>
+                            ) : (
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, background: '#fee2e2', color: '#b91c1c', padding: '3px 8px', borderRadius: 6, fontWeight: 800, fontSize: 11 }} title={log.error}>
+                                <AlertCircle size={12} /> Thất bại
+                              </span>
+                            )}
+                          </td>
+                          <td style={{ padding: '10px 12px', fontFamily: 'monospace', fontSize: 10.5, color: '#64748b', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.messageId || log.error}>
+                            {log.messageId || log.error || '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div style={{
+              padding: '12px 20px',
+              borderTop: '1.5px solid #e2e8f0',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              background: '#f8fafc',
+            }}>
+              <span style={{ fontSize: 12, color: '#64748b' }}>
+                💡 Nếu shop báo không nhận được: hướng dẫn shop kiểm tra mục <strong>Thư rác (Spam)</strong> hoặc <strong>Quảng cáo</strong> trong Gmail.
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsLogsModalOpen(false)}
+                className="btn btn-secondary btn-sm"
+                style={{ padding: '6px 16px', fontWeight: 700 }}
+              >
+                Đóng
+              </button>
             </div>
           </div>
         </div>

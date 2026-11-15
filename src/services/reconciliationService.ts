@@ -151,7 +151,7 @@ export function checkDuplicateWaybills(
         }
       }
     }
-    for (const order of session.unmatchedOrders) {
+    for (const order of [...(session.unmatchedOrders || []), ...(session.skippedOrders || [])]) {
       if (order.waybill) {
         existingWaybillMap.set(order.waybill.trim().toUpperCase(), {
           sessionId: session.id,
@@ -428,6 +428,98 @@ export function performReconciliation(
     }
   }
 
+  // 🧠 SMART IDENTIFICATION INDEX (Tự động cứu đơn thiếu từ Pancake, UPOS, cụm vận đơn & lịch sử)
+  const waybillToHistoricalShop = new Map<string, Shop>();
+  const pancakeCodeToShop = new Map<string, Shop>();
+  const uposKnownClusters: { num: number; shop: Shop }[] = [];
+  const prefixClusterMap = new Map<string, Map<string, { count: number; shop: Shop }>>();
+
+  // 1. Index registered shops
+  const registeredShopsMap = new Map<string, Shop>();
+  for (const s of registeredShops) {
+    if (s.id) registeredShopsMap.set(s.id, s);
+    if (s.code) pancakeCodeToShop.set(String(s.code).trim().toUpperCase(), s);
+    if ((s as any).prefixKeywords && Array.isArray((s as any).prefixKeywords)) {
+      (s as any).prefixKeywords.forEach((kw: string) => {
+        if (kw) pancakeCodeToShop.set(String(kw).trim().toUpperCase(), s);
+      });
+    }
+  }
+
+  // 2. Index past sessions (history waybills & past Pancake/UPOS codes)
+  for (const past of existingSessions) {
+    for (const st of (past.statements || [])) {
+      const shop = registeredShopsMap.get(st.shopId) || registeredShops.find(s => s.name?.trim().toLowerCase() === st.shopName?.trim().toLowerCase());
+      if (!shop) continue;
+      for (const ord of (st.orders || [])) {
+        if (ord.waybill) {
+          waybillToHistoricalShop.set(ord.waybill.trim().toUpperCase(), shop);
+        }
+        const raw = ord.rawNvcData || {};
+        const ma = String(raw["Mã đơn KH"] || raw["Mã đơn khách hàng"] || "").trim();
+        const m = ma.match(/^S([0-9]+)O/i);
+        if (m) {
+          pancakeCodeToShop.set(m[1].toUpperCase(), shop);
+        }
+        if (ma.startsWith("UPOS")) {
+          const num = parseInt(ma.replace("UPOS", ""), 10);
+          if (!isNaN(num)) uposKnownClusters.push({ num, shop });
+        }
+      }
+    }
+  }
+
+  // 3. Pre-correlate waybills and clusters from current appRows & nvcRows
+  if (mode === '2files' && appRows.length > 0) {
+    for (const row of appRows) {
+      const waybillRaw = row[appMapping.waybillColumn];
+      if (isSummaryOrInvalidWaybill(waybillRaw)) continue;
+      const waybill = waybillRaw.toString().trim().toUpperCase();
+
+      const shopName = String(appMapping.shopNameColumn ? row[appMapping.shopNameColumn] || '' : '').trim();
+      const shopPhone = String(appMapping.shopPhoneColumn ? row[appMapping.shopPhoneColumn] || '' : '').trim();
+      const shopCode = String(appMapping.shopCodeColumn ? row[appMapping.shopCodeColumn] || '' : '').trim();
+      const match = findRegisteredShop(registeredShops, { phone: shopPhone, code: shopCode, name: shopName });
+      if (match.matched) {
+        const matchedShop = match.shop;
+        if (waybill.length >= 6) {
+          const p6 = waybill.slice(0, 6);
+          if (!prefixClusterMap.has(p6)) prefixClusterMap.set(p6, new Map());
+          const cluster = prefixClusterMap.get(p6)!;
+          const curr = cluster.get(matchedShop.id) || { count: 0, shop: matchedShop };
+          curr.count++;
+          cluster.set(matchedShop.id, curr);
+        }
+      }
+    }
+
+    // Correlate NVC rows that matched an appRow to learn their Pancake and UPOS codes
+    for (const nvcRow of nvcRows) {
+      const waybillRaw = nvcRow[nvcMapping.waybillColumn];
+      if (isSummaryOrInvalidWaybill(waybillRaw)) continue;
+      const waybill = waybillRaw.toString().trim().toUpperCase();
+      const appRow = appMap.get(waybill);
+      if (!appRow) continue;
+
+      const shopName = String(appMapping.shopNameColumn ? appRow[appMapping.shopNameColumn] || '' : '').trim();
+      const shopPhone = String(appMapping.shopPhoneColumn ? appRow[appMapping.shopPhoneColumn] || '' : '').trim();
+      const shopCode = String(appMapping.shopCodeColumn ? appRow[appMapping.shopCodeColumn] || '' : '').trim();
+      const match = findRegisteredShop(registeredShops, { phone: shopPhone, code: shopCode, name: shopName });
+      if (match.matched) {
+        const shop = match.shop;
+        const rawCust = String(nvcRow["Mã đơn KH"] || nvcRow["Mã đơn khách hàng"] || "").trim();
+        const m = rawCust.match(/^S([0-9]+)O/i);
+        if (m) {
+          pancakeCodeToShop.set(m[1].toUpperCase(), shop);
+        }
+        if (rawCust.startsWith("UPOS")) {
+          const num = parseInt(rawCust.replace("UPOS", ""), 10);
+          if (!isNaN(num)) uposKnownClusters.push({ num, shop });
+        }
+      }
+    }
+  }
+
   const reconciledOrders: ReconciledOrder[] = [];
   const unmatchedOrders: ReconciledOrder[] = [];
 
@@ -494,11 +586,65 @@ export function performReconciliation(
     const productName = extractRowField(appRow, nvcRow, appMapping.productNameColumn || nvcMapping.productNameColumn, ['ten_san_pham', 'hang_hoa', 'ten_hang', 'san_pham', 'noi_dung', 'mo_ta', 'product', 'items']);
     const declaredValue = parseNumber(extractRowField(appRow, nvcRow, appMapping.declaredValueColumn || nvcMapping.declaredValueColumn, ['khai_gia', 'gia_tri_khai_gia', 'bao_hiem', 'declared_value']));
 
-    const hasBlockingDataIssue = (mode === '2files' && !appRow)
-      || (isJntCarrier && (!shopName && !shopPhone && !shopCode))
-      || status === 'unknown';
-      
-    const shopMatch = (mode === '2files' && !appRow)
+    let smartShopMatch: Shop | undefined = undefined;
+    let smartMethod: 'phone' | 'code' | 'name' | 'name_alias' = 'code';
+
+    if (mode === '2files' && !appRow) {
+      // 1. Check historical waybill
+      if (waybillToHistoricalShop.has(waybill)) {
+        smartShopMatch = waybillToHistoricalShop.get(waybill);
+        smartMethod = 'name';
+      }
+      // 2. Check Pancake Customer Order Code (S...O)
+      const rawCust = String(nvcRow["Mã đơn KH"] || nvcRow["Mã đơn khách hàng"] || "").trim();
+      if (!smartShopMatch && rawCust) {
+        const m = rawCust.match(/^S([0-9]+)O/i);
+        if (m && pancakeCodeToShop.has(m[1].toUpperCase())) {
+          smartShopMatch = pancakeCodeToShop.get(m[1].toUpperCase());
+          smartMethod = 'code';
+        }
+      }
+      // 3. Check UPOS proximity
+      if (!smartShopMatch && rawCust.startsWith("UPOS") && uposKnownClusters.length > 0) {
+        const num = parseInt(rawCust.replace("UPOS", ""), 10);
+        if (!isNaN(num)) {
+          let minDiff = Infinity;
+          let closest: { num: number; shop: Shop } | null = null;
+          for (const item of uposKnownClusters) {
+            const diff = Math.abs(item.num - num);
+            if (diff < minDiff) {
+              minDiff = diff;
+              closest = item;
+            }
+          }
+          if (minDiff <= 100 && closest) {
+            smartShopMatch = closest.shop;
+            smartMethod = 'code';
+          }
+        }
+      }
+      // 4. Check waybill prefix cluster (e.g. 842622...)
+      if (!smartShopMatch && waybill.length >= 6) {
+        const p6 = waybill.slice(0, 6);
+        const cluster = prefixClusterMap.get(p6);
+        if (cluster && cluster.size === 1) {
+          const entry = Array.from(cluster.values())[0];
+          smartShopMatch = entry.shop;
+          smartMethod = 'code';
+        }
+      }
+
+      if (smartShopMatch) {
+        shopName = smartShopMatch.name;
+        shopPhone = smartShopMatch.phone || '';
+        shopAddress = smartShopMatch.address || '';
+        shopCode = smartShopMatch.code || '';
+      }
+    }
+
+    const shopMatch: ShopMatchResult = smartShopMatch
+      ? { matched: true, shop: smartShopMatch, method: smartMethod }
+      : (mode === '2files' && !appRow)
       ? { matched: false as const, reason: 'Mã vận đơn có trong File NVC nhưng không tìm thấy trong File App xuất ra' }
       : (isJntCarrier && (!shopName && !shopPhone && !shopCode))
       ? { matched: false as const, reason: 'Thiếu Tên người gửi, SĐT người gửi và Mã kho/Shop trong File App' }
@@ -622,12 +768,12 @@ export function performReconciliation(
     const netShopPayout = effectiveCod - shopCalculatedFee - shopOtherFee;
     const profitMargin = (shopCalculatedFee + shopOtherFee) - (effectiveNvcFee + nvcOtherFee);
 
-    const isMatched = !!matchedShop;
-    const matchError = mode === '2files' && !appRow
-      ? 'Không tìm thấy mã vận đơn tương ứng trong File App'
+    const isMatched = !!matchedShop && shopMatch.matched;
+    const matchError = isMatched
+      ? undefined
       : !shopMatch.matched
         ? shopMatch.reason
-        : undefined;
+        : (mode === '2files' && !appRow ? 'Không tìm thấy mã vận đơn tương ứng trong File App' : undefined);
 
     const order: ReconciledOrder = {
       id: `order_${index}_${waybill}`,
@@ -656,7 +802,7 @@ export function performReconciliation(
       matched: isMatched,
       shopMatchMethod: shopMatch.matched ? shopMatch.method : undefined,
       matchError,
-      canManualAssignShop: !matchedShop && !hasBlockingDataIssue,
+      canManualAssignShop: !isMatched,
       isPartialDelivery,
       declaredValue,
       declaredFee,
@@ -962,8 +1108,29 @@ export function recalculateSessionFees(
       let shopCalculatedFee = 0;
       let shopOtherFee = 0;
 
+      let effectiveNvcFee = order.nvcBaseFee || 0;
+      if (effectiveNvcFee === 0 && order.rawNvcData) {
+        for (const [key, val] of Object.entries(order.rawNvcData)) {
+          const normKey = normalizeHeader(key);
+          if (
+            normKey === 'tc_sau_ck_sau_vat' ||
+            normKey === 'tc_sau_ck_truoc_vat' ||
+            normKey === 'tien_phai_thu' ||
+            normKey === 'tien_cuoc_pp_pm' ||
+            normKey === 'cuoc_phi' ||
+            normKey === 'tong_cuoc'
+          ) {
+            const parsed = parseNumber(val);
+            if (parsed > 0) {
+              effectiveNvcFee = parsed;
+              break;
+            }
+          }
+        }
+      }
+
       // 🔑 STRICT BUSINESS RULE: Only charge Shop fee if NVC file charged a fee for this order
-      const nvcHasFee = (Math.abs(order.nvcBaseFee) + Math.abs(order.nvcOtherFee)) > 0;
+      const nvcHasFee = (Math.abs(effectiveNvcFee) + Math.abs(order.nvcOtherFee)) > 0;
 
       if (nvcHasFee) {
         shopCalculatedFee = calculateWeightFee(order.weight || 0.5, pricingPlan);
@@ -994,10 +1161,11 @@ export function recalculateSessionFees(
       }
 
       const netShopPayout = order.codAmount - shopCalculatedFee - shopOtherFee;
-      const profitMargin = (shopCalculatedFee + shopOtherFee) - (order.nvcBaseFee + order.nvcOtherFee);
+      const profitMargin = (shopCalculatedFee + shopOtherFee) - (effectiveNvcFee + order.nvcOtherFee);
 
       const updatedOrder: ReconciledOrder = {
         ...order,
+        nvcBaseFee: effectiveNvcFee,
         shopCalculatedFee,
         shopOtherFee,
         netShopPayout,

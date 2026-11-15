@@ -19,7 +19,7 @@ export function normalizeHeader(header: string): string {
 
 const ALIASES = {
   waybill: [
-    'ma_van_don', 'mvd', 'tracking_number', 'tracking_code', 'ma_don', 'ma_don_hang',
+    'so_van_don', 'ma_van_don', 'mvd', 'tracking_number', 'tracking_code', 'ma_don', 'ma_don_hang',
     'ma_phieu_gui', 'ma_buu_gui', 'order_code', 'tracking', 'ma_bill', 'so_hieu',
     'so_hieu_buu_gui', 'ma_kien_hang', 'waybill', 'ma_giao_hang', 'ma_tra_cuu',
     'client_order_code', 'order_id', 'order_no', 'order_number', 'ma_don_nvc',
@@ -34,10 +34,12 @@ const ALIASES = {
     'tien_cod_1', 'tien_thu_ho_vnd_a', 'tien_thu_ho_vnd'
   ],
   fee: [
-    'phi_dich_vu_5', 'phi_dich_vu', 'cuoc_phi', 'tong_cuoc', 'cuoc_van_chuyen', 'phi_van_chuyen', 'cuoc_chinh',
-    'tong_phi', 'cuoc_thuc_te', 'cuoc_phi_goc', 'cuoc_nvc',
+    'tc_sau_ck_sau_vat', 'tc_sau_ck_truoc_vat', 'tien_phai_thu',
+    'tien_cuoc_pp_pm', 'cuoc_phi', 'tong_cuoc', 'tong_cuoc_sau_ck', 'tong_cuoc_sau_vat',
+    'cuoc_sau_ck', 'cuoc_sau_chiet_khau', 'cuoc_van_chuyen', 'phi_van_chuyen', 'cuoc_chinh',
+    'phi_dich_vu_5', 'phi_dich_vu', 'tong_phi', 'cuoc_thuc_te', 'cuoc_phi_goc', 'cuoc_nvc',
     'shipping_fee', 'fee', 'tong_tien_cuoc', 'cuoc_tam_tinh', 'phi_giao_hang', 'phi_giao_hang_5_1',
-    'cuoc_tru', 'phi_chinh', 'tong_phi_giao_hang', 'phi_dich_vu_chinh', 'tien_cuoc_pp_pm',
+    'cuoc_tru', 'phi_chinh', 'tong_phi_giao_hang', 'phi_dich_vu_chinh',
     'tong_phi_phai_tra_vnd_c_1_2_3', 'tong_phi_phai_tra', 'phi_giao_hang_vnd_1_1_1_1_2_1_3_1_4_1_5'
   ],
   otherFee: [
@@ -120,7 +122,7 @@ export function autoDetectColumnsWithConfidence(
   const mapping: ColumnMappingConfig = { waybillColumn: '' };
   const confidences: Record<string, ColumnMatchConfidence> = {};
 
-  const waybillForbidden = ['danh_sach', 'bao_cao', 'cong_ty', 'stt', 'nguoi_gui', 'nguoi_nhan', 'dia_chi', 'sdt', 'tien', 'cod', 'cuoc', 'phi'];
+  const waybillForbidden = ['don_con', 'ma_don_con', 'danh_sach', 'bao_cao', 'cong_ty', 'stt', 'nguoi_gui', 'nguoi_nhan', 'dia_chi', 'sdt', 'tien', 'cod', 'cuoc', 'phi'];
 
   const findBestMatchWithScore = (
     key: keyof ColumnMappingConfig,
@@ -141,11 +143,11 @@ export function autoDetectColumnsWithConfidence(
       return savedCol;
     }
 
-    // 2. Exact match
-    for (const header of headers) {
-      const normalized = normalizeHeader(header);
-      if (mustNotInclude.some(forbidden => normalized.includes(forbidden))) continue;
-      for (const alias of aliases) {
+    // 2. Exact match (by alias priority)
+    for (const alias of aliases) {
+      for (const header of headers) {
+        const normalized = normalizeHeader(header);
+        if (mustNotInclude.some(forbidden => normalized.includes(forbidden))) continue;
         if (normalized === alias) {
           confidences[key] = {
             columnKey: key,
@@ -159,11 +161,11 @@ export function autoDetectColumnsWithConfidence(
       }
     }
 
-    // 3. Substring match
-    for (const header of headers) {
-      const normalized = normalizeHeader(header);
-      if (mustNotInclude.some(forbidden => normalized.includes(forbidden))) continue;
-      for (const alias of aliases) {
+    // 3. Substring match (by alias priority)
+    for (const alias of aliases) {
+      for (const header of headers) {
+        const normalized = normalizeHeader(header);
+        if (mustNotInclude.some(forbidden => normalized.includes(forbidden))) continue;
         if (normalized.startsWith(alias + '_') || normalized.endsWith('_' + alias) || normalized.includes(alias)) {
           confidences[key] = {
             columnKey: key,
@@ -269,7 +271,7 @@ export function autoDetectColumns(
     waybillColumn: '',
   };
 
-  const waybillForbidden = ['danh_sach', 'bao_cao', 'cong_ty', 'stt', 'nguoi_gui', 'nguoi_nhan', 'dia_chi', 'sdt', 'tien', 'cod', 'cuoc', 'phi'];
+  const waybillForbidden = ['don_con', 'ma_don_con', 'danh_sach', 'bao_cao', 'cong_ty', 'stt', 'nguoi_gui', 'nguoi_nhan', 'dia_chi', 'sdt', 'tien', 'cod', 'cuoc', 'phi'];
 
   const findBestMatch = (
     aliases: string[], 
@@ -499,10 +501,23 @@ export function isSummaryOrInvalidWaybill(waybillRaw: any): boolean {
     'thong_ke',
     'tong_ket',
     'bao_cao',
-    'so_luong'
+    'so_luong',
+    'phien',
+    'ngay',
+    'no_ton',
+    'phi_chuyen_khoan',
+    'hoan_lai',
+    'thuc_nhan',
+    'ghi_no',
+    'danh_sach'
   ];
 
   if (summaryKeywords.some(kw => normalized === kw || normalized.startsWith(kw + '_'))) {
+    return true;
+  }
+
+  // Pure row index (1 to 4 digits like 1, 2, 1500) is a line number, never a waybill
+  if (/^\d{1,4}$/.test(str)) {
     return true;
   }
 

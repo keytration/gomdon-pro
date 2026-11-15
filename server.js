@@ -1,17 +1,38 @@
 import express from 'express';
+import compression from 'compression';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
+import { enforceLicenseProtection, getActiveLicenseInfo, getHardwareId } from './license.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Kiểm tra nhanh mã HWID nếu chạy flag --hwid
+if (process.argv.includes('--hwid')) {
+  console.log(getHardwareId());
+  process.exit(0);
+}
+
+let currentDir = '';
+try {
+  if (typeof __dirname !== 'undefined' && __dirname) {
+    currentDir = __dirname;
+  } else if (typeof import.meta !== 'undefined' && import.meta.url) {
+    currentDir = path.dirname(fileURLToPath(import.meta.url));
+  }
+} catch {
+  currentDir = process.cwd();
+}
+
+const IS_PACKAGED = Boolean(process.pkg);
+const APP_ROOT = IS_PACKAGED ? path.dirname(process.execPath) : (currentDir || process.cwd());
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Kích hoạt nén Gzip cho toàn bộ HTTP response
+app.use(compression());
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
@@ -31,6 +52,7 @@ app.get('/api/system/status', (req, res) => {
     res.json({
       success: true,
       timestamp: Date.now(),
+      license: getActiveLicenseInfo(),
       vps: {
         platform: os.platform(),
         arch: os.arch(),
@@ -52,9 +74,20 @@ app.get('/api/system/status', (req, res) => {
 });
 
 // ──────────────────────────────────────────
+// 🔑 LICENSE API (Trả về trạng thái bản quyền cho Client)
+// ──────────────────────────────────────────
+app.get('/api/system/license', (req, res) => {
+  const info = getActiveLicenseInfo();
+  if (!info) {
+    return res.status(403).json({ success: false, message: 'Chưa có thông tin bản quyền hoặc chưa kích hoạt' });
+  }
+  res.json({ success: true, license: info });
+});
+
+// ──────────────────────────────────────────
 // 📁 SERVER-SIDE PERSISTENT STORAGE (JSON DATABASE)
 // ──────────────────────────────────────────
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(APP_ROOT, 'data');
 const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
 
 if (!fs.existsSync(DATA_DIR)) {
@@ -1160,14 +1193,6 @@ function createSnapshot(reason = 'auto') {
   }
 }
 
-// Auto snapshot on server startup
-createSnapshot('boot');
-
-// Periodic snapshot every 6 hours
-setInterval(() => {
-  createSnapshot('cron_6h');
-}, 6 * 60 * 60 * 1000);
-
 // ──────────────────────────────────────────
 // 🌐 DB API ENDPOINTS
 // ──────────────────────────────────────────
@@ -1312,6 +1337,355 @@ app.post('/api/db/sessions/delete', requireAuth, requireAdmin, (req, res) => {
   }
 });
 
+// Helper functions for intelligent history auto-matching
+function calculateWeightFeeNode(weight, plan) {
+  if (!plan || !plan.weightRules || plan.weightRules.length === 0) {
+    return 25000;
+  }
+  const safeWeight = Math.min(100, Math.max(0.01, Number(weight) || 0.5));
+  const sortedRules = [...plan.weightRules].sort((a, b) => a.maxWeight - b.maxWeight);
+
+  const exactMatch = sortedRules.find(rule => safeWeight >= rule.minWeight && safeWeight <= rule.maxWeight);
+  if (exactMatch) return exactMatch.price;
+
+  const nearestCeiling = sortedRules.find(rule => safeWeight <= rule.maxWeight);
+  if (nearestCeiling) return nearestCeiling.price;
+
+  const highestRule = sortedRules[sortedRules.length - 1];
+  const excessWeight = safeWeight - highestRule.maxWeight;
+  const stepWeight = plan.extraStepWeight > 0 ? plan.extraStepWeight : 1;
+  const stepPrice = plan.extraStepPrice > 0 ? plan.extraStepPrice : 5000;
+
+  const steps = Math.ceil(excessWeight / stepWeight);
+  return highestRule.price + (steps * stepPrice);
+}
+
+function calculateShopFeeForOrderNode(order, plan) {
+  let shopCalculatedFee = 0;
+  let shopOtherFee = 0;
+  let declaredFee = 0;
+
+  const nvcFee = Math.abs(order.nvcBaseFee || 0);
+  const nvcOtherFee = Math.abs(order.nvcOtherFee || 0);
+  const nvcHasFee = (nvcFee > 0 || nvcOtherFee > 0);
+
+  if (nvcHasFee && plan) {
+    shopCalculatedFee = calculateWeightFeeNode(order.weight, plan);
+    shopOtherFee = plan.fixedSurcharge || 0;
+
+    if (order.status === 'returned' || order.status === 'returning') {
+      const returnFeeType = plan.returnFeeType || (plan.returnFeePercent === 0 ? 'free' : 'percent');
+      if (returnFeeType === 'free') {
+        shopCalculatedFee = 0;
+      } else if (returnFeeType === 'fixed') {
+        shopCalculatedFee = plan.returnFeeFixed !== undefined ? plan.returnFeeFixed : 0;
+      } else {
+        const returnRatio = (plan.returnFeePercent !== undefined ? plan.returnFeePercent : 50) / 100;
+        shopCalculatedFee = Math.round(shopCalculatedFee * returnRatio);
+      }
+    }
+
+    if (order.isPartialDelivery && plan.partialDeliveryFee) {
+      shopOtherFee += plan.partialDeliveryFee;
+    }
+
+    if (plan.insuranceFeePercent && plan.insuranceFeePercent > 0 && order.codAmount > 0) {
+      shopOtherFee += Math.round((order.codAmount * plan.insuranceFeePercent) / 100);
+    }
+
+    if (order.declaredValue > 0 && plan.declaredFeePercent && plan.declaredFeePercent > 0) {
+      declaredFee = Math.round((order.declaredValue * plan.declaredFeePercent) / 100);
+      shopOtherFee += declaredFee;
+    }
+  } else {
+    // NVC did not charge fee in this session -> 0đ to prevent double charging
+    shopCalculatedFee = 0;
+    shopOtherFee = 0;
+  }
+
+  const netShopPayout = (order.codAmount || 0) - shopCalculatedFee - shopOtherFee;
+  const profitMargin = (shopCalculatedFee + shopOtherFee) - (order.nvcBaseFee || 0) - (order.nvcOtherFee || 0);
+
+  return { shopCalculatedFee, shopOtherFee, declaredFee, netShopPayout, profitMargin };
+}
+
+// POST auto-match unmatched orders from history and customer order code (Pancake S...O)
+app.post('/api/reconciliation/auto-match-history', requireAuth, requireFinanceWrite, (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ success: false, error: 'Thiếu sessionId' });
+
+    const session = readSessionDetail(sessionId);
+    if (!session) return res.status(404).json({ success: false, error: 'Không tìm thấy kỳ đối soát' });
+
+    if (!session.unmatchedOrders || session.unmatchedOrders.length === 0) {
+      return res.json({ success: true, matchedCount: 0, remainingUnmatched: 0, message: 'Kỳ này không có đơn chưa khớp nào cần xử lý.' });
+    }
+
+    const shops = readJsonFile('shops.json', []);
+    const shopsMap = new Map();
+    shops.forEach(s => {
+      if (s.id) shopsMap.set(s.id, s);
+      if (s.name) shopsMap.set(s.name.trim().toLowerCase(), s);
+    });
+
+    const waybillToShop = new Map();
+    const pancakeCodeToShop = new Map();
+
+    // Map shop codes from shops.json
+    shops.forEach(s => {
+      if (s.code) pancakeCodeToShop.set(String(s.code).trim(), s);
+      if (s.prefixKeywords && Array.isArray(s.prefixKeywords)) {
+        s.prefixKeywords.forEach(kw => {
+          if (kw) pancakeCodeToShop.set(String(kw).trim(), s);
+        });
+      }
+    });
+
+    // Read history sessions
+    if (fs.existsSync(SESSIONS_DIR)) {
+      const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json') && !f.includes(sessionId));
+      for (const f of files) {
+        try {
+          const pastSess = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
+          for (const st of (pastSess.statements || [])) {
+            const foundShop = shopsMap.get(st.shopId) || shopsMap.get((st.shopName || '').trim().toLowerCase());
+            for (const ord of (st.orders || [])) {
+              if (ord.waybill && foundShop) {
+                waybillToShop.set(ord.waybill.trim().toUpperCase(), foundShop);
+              }
+              const raw = ord.rawNvcData || {};
+              const ma = String(raw["Mã đơn KH"] || raw["Mã đơn khách hàng"] || "");
+              const m = ma.match(/^S([0-9]+)O/i);
+              if (m && foundShop) {
+                pancakeCodeToShop.set(m[1], foundShop);
+              }
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    // Build UPOS proximity list & waybill prefix clusters from current session & history
+    const uposList = [];
+    const prefixClusterMap = new Map(); // prefix6 -> Map(shopId -> count)
+
+    // Index from current session statements
+    (session.statements || []).forEach(st => {
+      const foundShop = shopsMap.get(st.shopId) || shopsMap.get((st.shopName || '').trim().toLowerCase());
+      if (!foundShop) return;
+      (st.orders || []).forEach(ord => {
+        const raw = ord.rawNvcData || {};
+        const ma = String(raw["Mã đơn KH"] || "").trim();
+        if (ma.startsWith('UPOS')) {
+          const num = parseInt(ma.replace('UPOS', ''), 10);
+          if (!isNaN(num)) uposList.push({ num, code: ma, shop: foundShop });
+        }
+        const wb = String(ord.waybill || '').trim();
+        if (wb.length >= 6) {
+          const p6 = wb.slice(0, 6);
+          if (!prefixClusterMap.has(p6)) prefixClusterMap.set(p6, new Map());
+          const map = prefixClusterMap.get(p6);
+          map.set(foundShop.id, (map.get(foundShop.id) || 0) + 1);
+        }
+      });
+    });
+
+    const stillUnmatched = [];
+    let matchedCount = 0;
+    const statements = [...(session.statements || [])];
+
+    const getOrCreateStatement = (targetShop) => {
+      let st = statements.find(s => s.shopId === targetShop.id);
+      if (!st) {
+        st = {
+          shopId: targetShop.id,
+          shopCode: targetShop.code || 'SHOP',
+          shopName: targetShop.name,
+          periodName: session.sessionName,
+          totalOrders: 0,
+          deliveredOrders: 0,
+          shippingOrders: 0,
+          returnedOrders: 0,
+          inTransitOrders: 0,
+          partialOrders: 0,
+          totalCod: 0,
+          totalShopFee: 0,
+          totalShopOtherFee: 0,
+          totalNetPayout: 0,
+          previousDebt: 0,
+          totalNvcCost: 0,
+          totalProfit: 0,
+          totalDeliveredCod: 0,
+          totalDeliveredFee: 0,
+          totalReturnedFee: 0,
+          totalPartialCod: 0,
+          totalPartialFee: 0,
+          emailStatus: 'idle',
+          bankInfo: targetShop.bankInfo || { bankName: '', accountNumber: '', accountHolder: '' },
+          orders: []
+        };
+        statements.push(st);
+      }
+      return st;
+    };
+
+    for (const ord of session.unmatchedOrders) {
+      const wb = (ord.waybill || '').trim().toUpperCase();
+      let targetShop = waybillToShop.get(wb);
+      let method = 'history_waybill';
+
+      const raw = ord.rawNvcData || {};
+      const ma = String(raw["Mã đơn KH"] || raw["Mã đơn khách hàng"] || "").trim();
+
+      if (!targetShop && ma) {
+        const m = ma.match(/^S([0-9]+)O/i);
+        if (m && pancakeCodeToShop.has(m[1])) {
+          targetShop = pancakeCodeToShop.get(m[1]);
+          method = 'pancake_shop_code';
+        }
+      }
+
+      // Check GHN store code / shop code
+      if (!targetShop) {
+        const storeCode = String(raw["Mã Shop/Kho"] || raw["Cửa hàng"] || "").trim();
+        if (storeCode) {
+          for (const s of shops) {
+            const sc = String(s.code || '').trim();
+            if (sc && (storeCode === sc || storeCode.startsWith(sc) || storeCode.includes(sc))) {
+              targetShop = s;
+              method = 'ghn_store_code';
+              break;
+            }
+          }
+        }
+      }
+
+      // UPOS batch proximity matching (consecutive order sequence)
+      if (!targetShop && ma.startsWith('UPOS')) {
+        const num = parseInt(ma.replace('UPOS', ''), 10);
+        if (!isNaN(num) && uposList.length > 0) {
+          let minDiff = Infinity;
+          let closest = null;
+          for (const item of uposList) {
+            const diff = Math.abs(item.num - num);
+            if (diff < minDiff) {
+              minDiff = diff;
+              closest = item;
+            }
+          }
+          if (minDiff <= 100 && closest) {
+            targetShop = closest.shop;
+            method = 'upos_batch_proximity';
+          }
+        }
+      }
+
+      // Waybill prefix clustering (e.g., unique batch range for a dedicated shop)
+      if (!targetShop && wb.length >= 6) {
+        const p6 = wb.slice(0, 6);
+        const cluster = prefixClusterMap.get(p6);
+        if (cluster && cluster.size === 1) {
+          const shopId = Array.from(cluster.keys())[0];
+          targetShop = shopsMap.get(shopId);
+          if (targetShop) method = 'waybill_prefix_cluster';
+        }
+      }
+
+      if (!targetShop) {
+        stillUnmatched.push({
+          ...ord,
+          canManualAssignShop: true
+        });
+        continue;
+      }
+
+      const { shopCalculatedFee, shopOtherFee, declaredFee, netShopPayout, profitMargin } = calculateShopFeeForOrderNode(ord, targetShop.pricingPlan);
+
+      const isDelivered = ord.status === 'delivered';
+      const isReturned = ord.status === 'returned' || ord.status === 'returning';
+      const isInTransit = !isDelivered && !isReturned;
+
+      const matchedOrder = {
+        ...ord,
+        shopId: targetShop.id,
+        shopName: targetShop.name,
+        shopPhone: targetShop.phone || '',
+        shopAddress: targetShop.address || '',
+        shopCalculatedFee,
+        shopOtherFee,
+        declaredFee,
+        netShopPayout,
+        profitMargin,
+        matched: true,
+        shopMatchMethod: method,
+        matchError: undefined,
+        canManualAssignShop: false
+      };
+
+      const stmt = getOrCreateStatement(targetShop);
+      stmt.orders.push(matchedOrder);
+
+      const hasShippingFee = (shopCalculatedFee + shopOtherFee) > 0 || (Math.abs(ord.nvcBaseFee || 0) + Math.abs(ord.nvcOtherFee || 0)) > 0;
+      stmt.totalOrders += 1;
+      if (ord.codAmount > 0) stmt.deliveredOrders += 1;
+      if (hasShippingFee) stmt.shippingOrders += 1;
+      if (isReturned) stmt.returnedOrders += 1;
+      if (isInTransit) stmt.inTransitOrders += 1;
+      if (ord.isPartialDelivery) stmt.partialOrders += 1;
+
+      stmt.totalCod += ord.codAmount;
+      stmt.totalShopFee += shopCalculatedFee;
+      stmt.totalShopOtherFee += shopOtherFee;
+      stmt.totalNetPayout += netShopPayout;
+      stmt.totalNvcCost += ((ord.nvcBaseFee || 0) + (ord.nvcOtherFee || 0));
+      stmt.totalProfit += profitMargin;
+
+      if (isDelivered) {
+        stmt.totalDeliveredCod += ord.codAmount;
+        stmt.totalDeliveredFee += (shopCalculatedFee + shopOtherFee);
+      } else if (isReturned) {
+        stmt.totalReturnedFee += (shopCalculatedFee + shopOtherFee);
+      }
+
+      matchedCount++;
+    }
+
+    session.statements = statements.sort((a, b) => b.totalOrders - a.totalOrders);
+    session.unmatchedOrders = stillUnmatched;
+    session.matchedOrdersCount = (session.totalOrders || 0) - stillUnmatched.length;
+    session.unmatchedOrdersCount = stillUnmatched.length;
+
+    session.totalCod = statements.reduce((sum, s) => sum + s.totalCod, 0);
+    session.totalNvcCost = statements.reduce((sum, s) => sum + s.totalNvcCost, 0);
+    session.totalShopRevenue = statements.reduce((sum, s) => sum + s.totalShopFee + s.totalShopOtherFee, 0);
+    session.totalNetPayout = statements.reduce((sum, s) => sum + s.totalNetPayout, 0);
+    session.totalProfit = session.totalShopRevenue - session.totalNvcCost;
+
+    writeSessionDetail(session);
+
+    appendAuditLog({
+      action: 'AUTO_MATCH_HISTORY',
+      category: 'SESSIONS',
+      actorId: req.user?.id || 'admin',
+      actorName: req.user?.fullName || req.user?.username || 'Admin',
+      actorRole: req.user?.role || 'ADMIN',
+      description: `Tự động khớp ${matchedCount} đơn từ lịch sử & mã shop cho kỳ “${session.sessionName}”, còn ${stillUnmatched.length} đơn chưa khớp.`,
+      ipAddress: req.ip || '',
+    });
+
+    res.json({
+      success: true,
+      matchedCount,
+      remainingUnmatched: stillUnmatched.length,
+      updatedSession: session
+    });
+  } catch (err) {
+    console.error('Lỗi auto-match-history:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // POST save company info
 app.post('/api/db/company-info', requireAuth, requireFinanceWrite, (req, res) => {
   const companyInfo = req.body.companyInfo || {};
@@ -1342,7 +1716,16 @@ app.post('/api/db/company-info', requireAuth, requireFinanceWrite, (req, res) =>
 
 // POST save email settings
 app.post('/api/db/email-settings', requireAuth, requireFinanceWrite, (req, res) => {
-  const success = writeJsonFile('email_settings.json', req.body.emailSettings || {});
+  const current = readJsonFile('email_settings.json', {});
+  const incoming = req.body.emailSettings || {};
+  const merged = {
+    ...current,
+    ...incoming,
+    subjectTemplate: incoming.subjectTemplate || current.subjectTemplate || '【BẢNG KÊ ĐỐI SOÁT COD】{TEN_SHOP} - Kỳ {KY_DOI_SOAT}',
+    bodyTemplate: incoming.bodyTemplate || current.bodyTemplate || `Kính gửi Quý Khách hàng {TEN_SHOP},\n\nCông ty chúng tôi xin gửi đến Quý khách bảng kê đối soát tiền thu hộ (COD) và cước phí vận chuyển kỳ {KY_DOI_SOAT}.\n\nTHÔNG TIN TỔNG HỢP ĐỐI SOÁT:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Tổng số đơn hàng: {TONG_DON} đơn\n• Tổng tiền thu hộ (COD): {TONG_COD} đ\n• Tổng cước phí vận chuyển: {TONG_CUOC} đ\n• Phí khác/Phụ thu/Hoàn: {PHI_KHAC} đ\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n▶ KẾT QUẢ ĐỐI SOÁT: {THUC_TRA}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nTHÔNG TIN TÀI KHOẢN NHẬN TIỀN:\n• Ngân hàng: {NGAN_HANG}\n• Số tài khoản: {SO_TAI_KHOAN}\n• Chủ tài khoản: {CHU_TAI_KHOAN}\n\nChi tiết từng mã vận đơn, cân nặng và cước phí được đính kèm chi tiết trong file Excel đính kèm. Quý khách vui lòng kiểm tra và phản hồi trước 17h00 hôm nay nếu có khiếu nại.\n\nTrân trọng cảm ơn Quý khách đã luôn đồng hành cùng chúng tôi!\nPhòng Kế Toán - Đối Soát Vận Chuyển`,
+    autoAttachExcel: incoming.autoAttachExcel !== undefined ? incoming.autoAttachExcel : (current.autoAttachExcel !== undefined ? current.autoAttachExcel : true),
+  };
+  const success = writeJsonFile('email_settings.json', merged);
   res.json({ success });
 });
 
@@ -1510,8 +1893,23 @@ app.post('/api/send-telegram', requireAuth, async (req, res) => {
 });
 
 // ──────────────────────────────────────────
-// 📧 EMAIL API
+// 📧 EMAIL API & TELEMETRY LOGS
 // ──────────────────────────────────────────
+function sanitizeAttachmentFilename(rawName) {
+  if (!rawName) return 'bang_ke_doi_soat.xlsx';
+  const ext = path.extname(rawName) || '.xlsx';
+  const base = path.basename(rawName, ext);
+  const cleanBase = String(base)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return `${cleanBase || 'bang_ke'}${ext}`;
+}
+
 app.post('/api/send-email', async (req, res) => {
   try {
     const {
@@ -1551,23 +1949,71 @@ app.post('/api/send-email', async (req, res) => {
       },
     });
 
+    const safeAttachments = (attachments && Array.isArray(attachments) && attachments.length > 0)
+      ? attachments.map((att) => ({
+          filename: sanitizeAttachmentFilename(att.filename),
+          content: Buffer.from(att.content, 'base64'),
+          contentType: att.contentType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        }))
+      : [];
+
     const mailOptions = {
       from: senderName ? `"${senderName.trim()}" <${senderEmail.trim()}>` : senderEmail.trim(),
       to: to.trim(),
+      replyTo: senderEmail.trim(),
       subject: subject || 'Bảng Kê Đối Soát Gom Đơn',
       text: text || '',
       html: html || (text ? text.replace(/\n/g, '<br/>') : ''),
+      headers: {
+        'X-Mailer': 'GomDon Pro Logistics Mailer v2.0',
+        'X-Priority': '3',
+      },
+      attachments: safeAttachments,
     };
 
-    if (attachments && Array.isArray(attachments) && attachments.length > 0) {
-      mailOptions.attachments = attachments.map((att) => ({
-        filename: att.filename,
-        content: Buffer.from(att.content, 'base64'),
-        contentType: att.contentType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      }));
+    const info = await transporter.sendMail(mailOptions);
+    console.log(`[SMTP Sent] Từ: ${senderEmail.trim()} -> Tới: ${to.trim()} | MsgID: ${info.messageId} | Files: ${safeAttachments.map(a => a.filename).join(', ') || 'None'}`);
+
+    // Ghi nhận nhật ký audit log vào email_logs.json
+    try {
+      const logs = readJsonFile('email_logs.json', []);
+      logs.unshift({
+        id: `eml_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        timestamp: new Date().toISOString(),
+        to: to.trim(),
+        from: senderEmail.trim(),
+        senderName: senderName ? senderName.trim() : '',
+        subject: mailOptions.subject,
+        messageId: info.messageId,
+        status: 'sent',
+        attachments: safeAttachments.map(a => a.filename),
+        ipAddress: req.ip || req.socket?.remoteAddress,
+      });
+      if (logs.length > 500) logs.length = 500;
+      writeJsonFile('email_logs.json', logs);
+    } catch (logErr) {
+      console.warn('[Email Log Error]:', logErr.message);
     }
 
-    const info = await transporter.sendMail(mailOptions);
+    // Tự động lưu cấu hình email gửi thành công vào data/email_settings.json trên server
+    try {
+      const currentSettings = readJsonFile('email_settings.json', {});
+      const updatedSettings = {
+        ...currentSettings,
+        senderName: senderName ? senderName.trim() : (currentSettings.senderName || ''),
+        senderEmail: senderEmail.trim(),
+        smtpHost: smtpHost.trim(),
+        smtpPort: portNum,
+        emailPassword: cleanPassword || currentSettings.emailPassword || '',
+        subjectTemplate: currentSettings.subjectTemplate || '【BẢNG KÊ ĐỐI SOÁT COD】{TEN_SHOP} - Kỳ {KY_DOI_SOAT}',
+        bodyTemplate: currentSettings.bodyTemplate || `Kính gửi Quý Khách hàng {TEN_SHOP},\n\nCông ty chúng tôi xin gửi đến Quý khách bảng kê đối soát tiền thu hộ (COD) và cước phí vận chuyển kỳ {KY_DOI_SOAT}.\n\nTHÔNG TIN TỔNG HỢP ĐỐI SOÁT:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• Tổng số đơn hàng: {TONG_DON} đơn\n• Tổng tiền thu hộ (COD): {TONG_COD} đ\n• Tổng cước phí vận chuyển: {TONG_CUOC} đ\n• Phí khác/Phụ thu/Hoàn: {PHI_KHAC} đ\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n▶ KẾT QUẢ ĐỐI SOÁT: {THUC_TRA}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nTHÔNG TIN TÀI KHOẢN NHẬN TIỀN:\n• Ngân hàng: {NGAN_HANG}\n• Số tài khoản: {SO_TAI_KHOAN}\n• Chủ tài khoản: {CHU_TAI_KHOAN}\n\nChi tiết từng mã vận đơn, cân nặng và cước phí được đính kèm chi tiết trong file Excel đính kèm. Quý khách vui lòng kiểm tra và phản hồi trước 17h00 hôm nay nếu có khiếu nại.\n\nTrân trọng cảm ơn Quý khách đã luôn đồng hành cùng chúng tôi!\nPhòng Kế Toán - Đối Soát Vận Chuyển`,
+        autoAttachExcel: currentSettings.autoAttachExcel !== undefined ? currentSettings.autoAttachExcel : true,
+        updatedAt: new Date().toISOString(),
+      };
+      writeJsonFile('email_settings.json', updatedSettings);
+    } catch (saveErr) {
+      console.warn('[AutoSave EmailSettings Error]:', saveErr.message);
+    }
 
     res.status(200).json({
       success: true,
@@ -1585,7 +2031,37 @@ app.post('/api/send-email', async (req, res) => {
       errorMsg =
         'Tài khoản hoặc Mật khẩu ứng dụng Gmail (App Password) không đúng. Vui lòng tạo Mật khẩu ứng dụng 16 ký tự tại myaccount.google.com/apppasswords.';
     }
+
+    // Ghi nhận log gửi thất bại
+    try {
+      const logs = readJsonFile('email_logs.json', []);
+      logs.unshift({
+        id: `eml_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        timestamp: new Date().toISOString(),
+        to: (req.body?.to || '').trim(),
+        from: (req.body?.senderEmail || '').trim(),
+        senderName: req.body?.senderName || '',
+        subject: req.body?.subject || '',
+        status: 'failed',
+        error: errorMsg,
+        ipAddress: req.ip || req.socket?.remoteAddress,
+      });
+      if (logs.length > 500) logs.length = 500;
+      writeJsonFile('email_logs.json', logs);
+    } catch (_) {}
+
     res.status(500).json({ success: false, error: errorMsg });
+  }
+});
+
+// 📜 LẤY DANH SÁCH NHẬT KÝ GỬI EMAIL
+app.get('/api/email-logs', requireAuth, (req, res) => {
+  try {
+    const logs = readJsonFile('email_logs.json', []);
+    const limit = Math.min(Number(req.query.limit) || 100, 500);
+    res.json({ success: true, logs: logs.slice(0, limit) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -1627,14 +2103,1049 @@ app.post('/api/zalo/send-zns', async (req, res) => {
   }
 });
 
-// Serve frontend static build
-app.use(express.static(path.join(__dirname, 'dist')));
+// ══════════════════════════════════════════════════════════════════════════
+// 🚀 QUẢN LÝ ỨNG COD HÀNG NGÀY (T+0) - STORAGE ENGINE & RESTFUL APIS
+// ══════════════════════════════════════════════════════════════════════════
+const ADVANCE_SESSIONS_DIR = path.join(DATA_DIR, 'advance_sessions');
+if (!fs.existsSync(ADVANCE_SESSIONS_DIR)) {
+  fs.mkdirSync(ADVANCE_SESSIONS_DIR, { recursive: true });
+}
 
-// Fallback for SPA Routing (Express 5 compatible)
-app.use((req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+// Initialise default storage files if missing
+if (!fs.existsSync(path.join(DATA_DIR, 'advance_sessions_summary.json'))) {
+  writeJsonFile('advance_sessions_summary.json', []);
+}
+if (!fs.existsSync(path.join(DATA_DIR, 'advance_orders_index.json'))) {
+  writeJsonFile('advance_orders_index.json', {});
+}
+if (!fs.existsSync(path.join(DATA_DIR, 'advance_debt_ledger.json'))) {
+  writeJsonFile('advance_debt_ledger.json', []);
+}
+if (!fs.existsSync(path.join(DATA_DIR, 'advance_shops.json'))) {
+  writeJsonFile('advance_shops.json', []);
+}
+
+function getSafeAdvanceSessionFilename(id) {
+  const safeId = String(id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `${safeId}.json`;
+}
+
+function stripAdvanceSessionOrders(session) {
+  if (!session || typeof session !== 'object') return session;
+  return {
+    id: session.id,
+    shopId: session.shopId,
+    shopCode: session.shopCode || '',
+    shopName: session.shopName || '',
+    advanceDate: session.advanceDate || '',
+    createdAt: session.createdAt || new Date().toISOString(),
+    createdByName: session.createdByName || '',
+    totalNewOrdersCount: Number(session.totalNewOrdersCount) || 0,
+    totalNewCod: Number(session.totalNewCod) || 0,
+    totalNewFee: Number(session.totalNewFee) || 0,
+    netNewAdvance: Number(session.netNewAdvance) || 0,
+    totalReturnedOrdersCount: Number(session.totalReturnedOrdersCount) || 0,
+    totalReturnedCodRecall: Number(session.totalReturnedCodRecall) || 0,
+    totalWeightAdjustment: Number(session.totalWeightAdjustment) || 0,
+    manualAdjustmentAmount: Number(session.manualAdjustmentAmount) || 0,
+    manualAdjustmentNote: session.manualAdjustmentNote || '',
+    previousDebt: Number(session.previousDebt) || 0,
+    netAdvancePayout: Number(session.netAdvancePayout) || 0,
+    closingDebt: Number(session.closingDebt) || 0,
+    payoutStatus: session.payoutStatus || 'UNPAID',
+    bankInfo: session.bankInfo || { bankName: '', accountNumber: '', accountHolder: '' },
+  };
+}
+
+function readAdvanceSessionsSummary() {
+  const summary = readJsonFile('advance_sessions_summary.json', null);
+  if (Array.isArray(summary)) return summary;
+  return [];
+}
+
+function readAdvanceSessionDetail(id) {
+  if (!id) return null;
+  const filename = getSafeAdvanceSessionFilename(id);
+  const filePath = path.join(ADVANCE_SESSIONS_DIR, filename);
+  if (fs.existsSync(filePath)) {
+    try {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch (err) {
+      console.error(`[Advance Session Read Error] ${id}:`, err);
+    }
+  }
+  return null;
+}
+
+function writeAdvanceSessionDetail(session) {
+  if (!session || !session.id) return false;
+  const filename = getSafeAdvanceSessionFilename(session.id);
+  const filePath = path.join(ADVANCE_SESSIONS_DIR, filename);
+  const tempPath = path.join(ADVANCE_SESSIONS_DIR, `${filename}.tmp.${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(session, null, 2), 'utf8');
+    const fd = fs.openSync(tempPath, 'r+');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fs.renameSync(tempPath, filePath);
+
+    // Update advance_sessions_summary.json
+    const summaryList = readAdvanceSessionsSummary();
+    const lightSession = stripAdvanceSessionOrders(session);
+    const idx = summaryList.findIndex(s => s.id === session.id);
+    if (idx >= 0) {
+      summaryList[idx] = lightSession;
+    } else {
+      summaryList.unshift(lightSession);
+    }
+    summaryList.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    writeJsonFile('advance_sessions_summary.json', summaryList);
+
+    return true;
+  } catch (err) {
+    console.error(`[Advance Session Write Error] ${session.id}:`, err);
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+    return false;
+  }
+}
+
+function deleteAdvanceSessionDetail(id) {
+  if (!id) return false;
+  const filename = getSafeAdvanceSessionFilename(id);
+  const filePath = path.join(ADVANCE_SESSIONS_DIR, filename);
+  let deleted = false;
+  if (fs.existsSync(filePath)) {
+    try {
+      fs.unlinkSync(filePath);
+      deleted = true;
+    } catch (err) {
+      console.error(`[Advance Session Delete Error] ${id}:`, err);
+    }
+  }
+  const summaryList = readAdvanceSessionsSummary();
+  const nextList = summaryList.filter(s => s.id !== id);
+  writeJsonFile('advance_sessions_summary.json', nextList);
+  return deleted;
+}
+
+// ── GET /api/cod-advance/shops ──
+app.get('/api/cod-advance/shops', requireAuth, (req, res) => {
+  try {
+    const shops = readJsonFile('advance_shops.json', []);
+    if (req.query.active === 'true') {
+      return res.json({ success: true, shops: shops.filter(s => s.active !== false) });
+    }
+    return res.json({ success: true, shops });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 GomDon Pro Enterprise server is running at http://0.0.0.0:${PORT}`);
+// ── POST /api/cod-advance/shops (Create / Update Shop & Pricing Plan) ──
+app.post('/api/cod-advance/shops', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const now = new Date().toISOString();
+
+    // Support bulk list update
+    if (Array.isArray(req.body.shops)) {
+      const validatedShops = req.body.shops.map(s => {
+        const plan = s.pricingPlan || {};
+        return {
+          ...s,
+          pricingPlan: {
+            ...plan,
+            returnFeePercent: 0,
+            returnFeeFixed: 0,
+            returnFeeType: 'free',
+          },
+          currentDebt: typeof s.currentDebt === 'number' ? s.currentDebt : 0,
+          active: s.active !== false,
+          createdAt: s.createdAt || now,
+          updatedAt: now,
+        };
+      });
+      const ok = writeJsonFile('advance_shops.json', validatedShops);
+      return res.json({ success: ok, shops: validatedShops });
+    }
+
+    // Single shop create/update
+    const shop = req.body.shop || req.body;
+    if (!shop || (!shop.id && !shop.name)) {
+      return res.status(400).json({ success: false, error: 'Thiếu thông tin shop (tên hoặc mã shop)' });
+    }
+
+    const shopId = shop.id || `adv_shop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const plan = shop.pricingPlan || {};
+    const sanitizedPlan = {
+      id: plan.id || `plan_${shopId}`,
+      name: plan.name || `Biểu phí ${shop.name || 'Shop'}`,
+      weightRules: Array.isArray(plan.weightRules) ? plan.weightRules : [
+        { minWeight: 0, maxWeight: 1, price: 20000 },
+        { minWeight: 1, maxWeight: 2, price: 25000 },
+      ],
+      extraStepWeight: typeof plan.extraStepWeight === 'number' ? plan.extraStepWeight : 0.5,
+      extraStepPrice: typeof plan.extraStepPrice === 'number' ? plan.extraStepPrice : 5000,
+      returnFeePercent: 0,
+      returnFeeFixed: 0,
+      returnFeeType: 'free',
+    };
+
+    const shopProfile = {
+      ...shop,
+      id: shopId,
+      code: shop.code || shop.name || shopId,
+      name: shop.name || shop.code || 'Shop',
+      phone: shop.phone || '',
+      address: shop.address || '',
+      bankAccount: shop.bankAccount || { bankName: '', accountNumber: '', accountHolder: '' },
+      pricingPlan: sanitizedPlan,
+      currentDebt: typeof shop.currentDebt === 'number' ? shop.currentDebt : 0,
+      active: shop.active !== false,
+      createdAt: shop.createdAt || now,
+      updatedAt: now,
+    };
+
+    const currentShops = readJsonFile('advance_shops.json', []);
+    const idx = currentShops.findIndex(s => s.id === shopProfile.id);
+    if (idx >= 0) {
+      currentShops[idx] = { ...currentShops[idx], ...shopProfile, updatedAt: now };
+    } else {
+      currentShops.push(shopProfile);
+    }
+    const ok = writeJsonFile('advance_shops.json', currentShops);
+
+    appendAuditLog({
+      action: 'SAVE_ADVANCE_SHOP',
+      category: 'PRICING',
+      actorId: req.authUser?.id || 'admin',
+      actorName: req.authUser?.name || req.authUser?.username || 'Admin',
+      actorRole: req.authUser?.role || 'ADMIN',
+      description: `Lưu cấu hình Shop Ứng COD: ${shopProfile.name} (${shopProfile.code})`,
+      metadata: { shopId: shopProfile.id },
+    });
+
+    return res.json({ success: ok, shop: shopProfile, shops: currentShops });
+  } catch (err) {
+    console.error('[Advance Shop Save Error]:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
 });
+
+// ── GET /api/cod-advance/shops/:shopId/current-debt ──
+app.get('/api/cod-advance/shops/:shopId/current-debt', requireAuth, (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const advanceShops = readJsonFile('advance_shops.json', []);
+    const found = advanceShops.find(s => s.id === shopId || s.code === shopId || s.linkedShopId === shopId);
+    if (found) {
+      return res.json({
+        success: true,
+        shopId: found.id,
+        currentDebt: typeof found.currentDebt === 'number' ? found.currentDebt : 0,
+      });
+    }
+
+    // Default to 0 for shops without prior advance debt
+    return res.json({
+      success: true,
+      shopId,
+      currentDebt: 0,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/cod-advance/sessions (Summaries list) ──
+app.get('/api/cod-advance/sessions', requireAuth, (req, res) => {
+  try {
+    const summaries = readAdvanceSessionsSummary();
+    return res.json({ success: true, sessions: summaries });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/cod-advance/sessions/:id (Full session detail) ──
+app.get('/api/cod-advance/sessions/:id', requireAuth, (req, res) => {
+  try {
+    const { id } = req.params;
+    const session = readAdvanceSessionDetail(id);
+    if (!session) {
+      return res.status(404).json({ success: false, error: 'Không tìm thấy kỳ ứng COD' });
+    }
+    return res.json({ success: true, session });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── POST /api/cod-advance/sessions (Save / Finalize advance session) ──
+app.post('/api/cod-advance/sessions', requireAuth, requireFinanceWrite, (req, res) => {
+  try {
+    const session = req.body.session || req.body;
+    if (!session || !session.shopId || !session.advanceDate) {
+      return res.status(400).json({ success: false, error: 'Thiếu thông tin bắt buộc của kỳ ứng (shopId, advanceDate)' });
+    }
+
+    if (!session.id) {
+      session.id = `adv_${session.shopId}_${String(session.advanceDate).replace(/-/g, '')}_${Date.now()}`;
+    }
+
+    const now = new Date().toISOString();
+    session.createdAt = session.createdAt || now;
+    session.createdByName = session.createdByName || req.authUser?.name || req.authUser?.username || 'Kế toán';
+
+    const newOrders = Array.isArray(session.newOrders) ? session.newOrders : [];
+    const returnedOrders = Array.isArray(session.returnedOrders) ? session.returnedOrders : [];
+    const weightAdjustments = Array.isArray(session.weightAdjustments) ? session.weightAdjustments : [];
+
+    session.totalNewOrdersCount = typeof session.totalNewOrdersCount === 'number'
+      ? session.totalNewOrdersCount
+      : newOrders.length;
+    session.totalNewCod = typeof session.totalNewCod === 'number'
+      ? session.totalNewCod
+      : newOrders.reduce((sum, o) => sum + (Number(o.codAmount) || 0), 0);
+    session.totalNewFee = typeof session.totalNewFee === 'number'
+      ? session.totalNewFee
+      : newOrders.reduce((sum, o) => sum + (Number(o.appliedFee) || 0), 0);
+    session.netNewAdvance = typeof session.netNewAdvance === 'number'
+      ? session.netNewAdvance
+      : (session.totalNewCod - session.totalNewFee);
+
+    session.totalReturnedOrdersCount = typeof session.totalReturnedOrdersCount === 'number'
+      ? session.totalReturnedOrdersCount
+      : returnedOrders.length;
+    session.totalReturnedCodRecall = typeof session.totalReturnedCodRecall === 'number'
+      ? session.totalReturnedCodRecall
+      : returnedOrders.reduce((sum, o) => sum + (Number(o.codAmount) || 0), 0);
+
+    session.totalWeightAdjustment = typeof session.totalWeightAdjustment === 'number'
+      ? session.totalWeightAdjustment
+      : weightAdjustments.reduce((sum, a) => sum + (Number(a.feeDifference) || 0), 0);
+
+    session.manualAdjustmentAmount = Number(session.manualAdjustmentAmount) || 0;
+    session.previousDebt = Number(session.previousDebt) || 0;
+
+    // Rolling Daily Settlement Formula (R2.4):
+    // Thực chuyển = (Tổng COD mới - Tổng cước mới) - Thu hồi COD đơn hoàn - Chênh lệch cước NVC + Dư/Nợ lũy kế
+    if (session.netAdvancePayout === undefined || session.netAdvancePayout === null) {
+      session.netAdvancePayout = session.netNewAdvance - session.totalReturnedCodRecall - session.totalWeightAdjustment + session.previousDebt;
+    } else {
+      session.netAdvancePayout = Number(session.netAdvancePayout);
+    }
+
+    // Negative debt rollover: if netAdvancePayout < 0, closingDebt = netAdvancePayout, else 0
+    if (session.closingDebt === undefined || session.closingDebt === null) {
+      session.closingDebt = session.netAdvancePayout < 0 ? session.netAdvancePayout : 0;
+    } else {
+      session.closingDebt = Number(session.closingDebt);
+    }
+
+    if (!session.payoutStatus) {
+      session.payoutStatus = session.netAdvancePayout < 0 ? 'NEGATIVE_DEBT' : 'UNPAID';
+    }
+
+    // 1. Write atomic session file and update summary
+    const writeOk = writeAdvanceSessionDetail(session);
+    if (!writeOk) {
+      return res.status(500).json({ success: false, error: 'Không thể ghi tệp dữ liệu kỳ ứng' });
+    }
+
+    // 2. Index new orders and mark returned orders
+    const orderIndex = readJsonFile('advance_orders_index.json', {});
+    for (const ord of newOrders) {
+      if (ord && ord.waybill) {
+        const wb = String(ord.waybill).trim().toUpperCase();
+        orderIndex[wb] = {
+          waybill: wb,
+          shopId: session.shopId,
+          shopCode: session.shopCode || '',
+          advanceSessionId: session.id,
+          advanceDate: session.advanceDate,
+          weight: Number(ord.weight) || 0,
+          appliedFee: Number(ord.appliedFee) || 0,
+          codAmount: Number(ord.codAmount) || 0,
+          isReturned: false,
+          createdAt: session.createdAt,
+        };
+      }
+    }
+
+    for (const ord of returnedOrders) {
+      if (ord && ord.waybill) {
+        const wb = String(ord.waybill).trim().toUpperCase();
+        if (orderIndex[wb]) {
+          orderIndex[wb].isReturned = true;
+          orderIndex[wb].returnedSessionId = session.id;
+          orderIndex[wb].returnedDate = session.advanceDate;
+        } else {
+          orderIndex[wb] = {
+            waybill: wb,
+            shopId: session.shopId,
+            shopCode: session.shopCode || '',
+            advanceSessionId: '',
+            advanceDate: '',
+            weight: 0,
+            appliedFee: 0,
+            codAmount: Number(ord.codAmount) || 0,
+            isReturned: true,
+            returnedSessionId: session.id,
+            returnedDate: session.advanceDate,
+            createdAt: session.createdAt,
+          };
+        }
+      }
+    }
+    writeJsonFile('advance_orders_index.json', orderIndex);
+
+    // 3. Record debt ledger entry
+    const ledger = readJsonFile('advance_debt_ledger.json', []);
+    const ledgerEntry = {
+      id: `adv_ledger_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      shopId: session.shopId,
+      sessionId: session.id,
+      sessionDate: session.advanceDate,
+      type: 'SESSION_SETTLEMENT',
+      openingDebt: session.previousDebt,
+      netSettlementChange: session.netAdvancePayout,
+      closingDebt: session.closingDebt,
+      description: session.netAdvancePayout < 0
+        ? `Quyết toán ứng T+0 ngày ${session.advanceDate}: âm ${Math.abs(session.netAdvancePayout).toLocaleString('vi-VN')}đ kết chuyển nợ sang kỳ sau`
+        : `Quyết toán ứng T+0 ngày ${session.advanceDate}: thực chuyển ${session.netAdvancePayout.toLocaleString('vi-VN')}đ (công nợ lũy kế đã khấu trừ)`,
+      timestamp: now,
+    };
+    ledger.push(ledgerEntry);
+    writeJsonFile('advance_debt_ledger.json', ledger);
+
+    // 4. Update shop's currentDebt in advance_shops.json
+    const shops = readJsonFile('advance_shops.json', []);
+    const shopIdx = shops.findIndex(s => s.id === session.shopId);
+    if (shopIdx >= 0) {
+      shops[shopIdx].currentDebt = session.closingDebt;
+      shops[shopIdx].updatedAt = now;
+      writeJsonFile('advance_shops.json', shops);
+    }
+
+    appendAuditLog({
+      action: 'SAVE_ADVANCE_SESSION',
+      category: 'PAYOUT',
+      actorId: req.authUser?.id || 'finance',
+      actorName: req.authUser?.name || req.authUser?.username || 'Kế toán',
+      actorRole: req.authUser?.role || 'ACCOUNTANT',
+      description: `Lưu chốt kỳ ứng COD T+0: ${session.shopName || session.shopId} - Ngày ${session.advanceDate} - Thực chuyển: ${session.netAdvancePayout.toLocaleString('vi-VN')}đ`,
+      metadata: { sessionId: session.id, shopId: session.shopId, netAdvancePayout: session.netAdvancePayout, closingDebt: session.closingDebt },
+    });
+
+    return res.json({ success: true, session });
+  } catch (err) {
+    console.error('[Advance Session Save Error]:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── DELETE /api/cod-advance/sessions/:id (Rollback session) ──
+const handleAdvanceSessionDelete = (req, res) => {
+  try {
+    const { id } = req.params;
+    const session = readAdvanceSessionDetail(id);
+    if (!session) {
+      return res.status(404).json({ success: false, error: 'Không tìm thấy kỳ ứng COD để xóa' });
+    }
+
+    // 1. Rollback order index
+    const orderIndex = readJsonFile('advance_orders_index.json', {});
+    if (Array.isArray(session.newOrders)) {
+      for (const ord of session.newOrders) {
+        if (ord && ord.waybill) {
+          const wb = String(ord.waybill).trim().toUpperCase();
+          if (orderIndex[wb] && orderIndex[wb].advanceSessionId === session.id) {
+            delete orderIndex[wb];
+          }
+        }
+      }
+    }
+    if (Array.isArray(session.returnedOrders)) {
+      for (const ord of session.returnedOrders) {
+        if (ord && ord.waybill) {
+          const wb = String(ord.waybill).trim().toUpperCase();
+          if (orderIndex[wb] && orderIndex[wb].returnedSessionId === session.id) {
+            orderIndex[wb].isReturned = false;
+            delete orderIndex[wb].returnedSessionId;
+            delete orderIndex[wb].returnedDate;
+          }
+        }
+      }
+    }
+    writeJsonFile('advance_orders_index.json', orderIndex);
+
+    // 2. Rollback debt ledger
+    const ledger = readJsonFile('advance_debt_ledger.json', []);
+    const filteredLedger = ledger.filter(l => l.sessionId !== session.id);
+    writeJsonFile('advance_debt_ledger.json', filteredLedger);
+
+    // 3. Restore shop's currentDebt
+    const shops = readJsonFile('advance_shops.json', []);
+    const shopIdx = shops.findIndex(s => s.id === session.shopId);
+    if (shopIdx >= 0) {
+      shops[shopIdx].currentDebt = typeof session.previousDebt === 'number' ? session.previousDebt : 0;
+      shops[shopIdx].updatedAt = new Date().toISOString();
+      writeJsonFile('advance_shops.json', shops);
+    }
+
+    // 4. Delete session file and remove from summary
+    deleteAdvanceSessionDetail(session.id);
+
+    appendAuditLog({
+      action: 'DELETE_ADVANCE_SESSION',
+      category: 'PAYOUT',
+      actorId: req.authUser?.id || 'admin',
+      actorName: req.authUser?.name || req.authUser?.username || 'Admin',
+      actorRole: req.authUser?.role || 'ADMIN',
+      description: `Xóa và hoàn tác kỳ ứng COD T+0: ${session.id} (${session.shopName || session.shopId})`,
+      metadata: { sessionId: session.id, shopId: session.shopId },
+    });
+
+    return res.json({ success: true, message: 'Đã hoàn tác và xóa kỳ ứng thành công' });
+  } catch (err) {
+    console.error('[Advance Session Delete Error]:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+app.delete('/api/cod-advance/sessions/:id', requireAuth, requireAdmin, handleAdvanceSessionDelete);
+app.post('/api/cod-advance/sessions/:id/delete', requireAuth, requireAdmin, handleAdvanceSessionDelete);
+
+// ── POST /api/cod-advance/orders/lookup (Batch order history lookup) ──
+app.post('/api/cod-advance/orders/lookup', requireAuth, (req, res) => {
+  try {
+    const { waybills, shopId } = req.body;
+    let list = [];
+    if (Array.isArray(waybills)) {
+      list = waybills;
+    } else if (typeof waybills === 'string') {
+      list = waybills.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+    }
+
+    const orderIndex = readJsonFile('advance_orders_index.json', {});
+    const orders = {};
+    for (const item of list) {
+      if (!item) continue;
+      const wb = String(item).trim().toUpperCase();
+      const rec = orderIndex[wb];
+      if (rec) {
+        if (!shopId || rec.shopId === shopId) {
+          orders[wb] = rec;
+        }
+      }
+    }
+
+    return res.json({
+      success: true,
+      count: Object.keys(orders).length,
+      orders,
+      ...orders,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/cod-advance/ledger ──
+app.get('/api/cod-advance/ledger', requireAuth, (req, res) => {
+  try {
+    const { shopId } = req.query;
+    const ledger = readJsonFile('advance_debt_ledger.json', []);
+    if (shopId) {
+      return res.json({ success: true, ledger: ledger.filter(l => l.shopId === shopId) });
+    }
+    return res.json({ success: true, ledger });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/cod-advance/ledger/:shopId ──
+app.get('/api/cod-advance/ledger/:shopId', requireAuth, (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const ledger = readJsonFile('advance_debt_ledger.json', []);
+    return res.json({ success: true, shopId, ledger: ledger.filter(l => l.shopId === shopId) });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── POST /api/cod-advance/ledger/adjust ──
+app.post('/api/cod-advance/ledger/adjust', requireAuth, requireFinanceWrite, (req, res) => {
+  try {
+    const { shopId, adjustmentAmount, description } = req.body;
+    if (!shopId || typeof adjustmentAmount !== 'number') {
+      return res.status(400).json({ success: false, error: 'Thiếu shopId hoặc adjustmentAmount' });
+    }
+
+    const shops = readJsonFile('advance_shops.json', []);
+    const shopIdx = shops.findIndex(s => s.id === shopId);
+    const openingDebt = shopIdx >= 0 ? (shops[shopIdx].currentDebt || 0) : 0;
+    const closingDebt = openingDebt + adjustmentAmount;
+
+    const now = new Date().toISOString();
+    if (shopIdx >= 0) {
+      shops[shopIdx].currentDebt = closingDebt;
+      shops[shopIdx].updatedAt = now;
+      writeJsonFile('advance_shops.json', shops);
+    }
+
+    const ledger = readJsonFile('advance_debt_ledger.json', []);
+    const ledgerEntry = {
+      id: `adv_adj_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      shopId,
+      sessionDate: now.slice(0, 10),
+      type: 'MANUAL_DEBT_ADJUSTMENT',
+      openingDebt,
+      netSettlementChange: adjustmentAmount,
+      closingDebt,
+      description: description || `Điều chỉnh công nợ thủ công: ${adjustmentAmount >= 0 ? '+' : ''}${adjustmentAmount.toLocaleString('vi-VN')}đ`,
+      timestamp: now,
+    };
+    ledger.push(ledgerEntry);
+    writeJsonFile('advance_debt_ledger.json', ledger);
+
+    return res.json({ success: true, ledgerEntry, currentDebt: closingDebt });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🛡️ ORDER LIFECYCLE & LOSS TRACKING APIs (KIỂM SOÁT ĐƠN MẤT & HÀNG HOÀN J&T)
+// ─────────────────────────────────────────────────────────────────────────────
+const TRACKING_DATA_FILE = 'order_lifecycle_tracking.json';
+const TRACKING_CONFIG_FILE = 'order_lifecycle_config.json';
+
+function getTrackingConfig() {
+  const cfg = readJsonFile(TRACKING_CONFIG_FILE, null);
+  if (cfg && typeof cfg === 'object') {
+    return {
+      riskDaysThreshold: Number(cfg.riskDaysThreshold) || 13,
+      lostDaysThreshold: Number(cfg.lostDaysThreshold) || 20,
+    };
+  }
+  return { riskDaysThreshold: 13, lostDaysThreshold: 20 };
+}
+
+function calculateOrderTotalDays(sentDateStr) {
+  if (!sentDateStr) return 0;
+  try {
+    const sent = new Date(sentDateStr);
+    if (isNaN(sent.getTime())) return 0;
+    const now = new Date();
+    const diffMs = now.getTime() - sent.getTime();
+    return Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
+  } catch {
+    return 0;
+  }
+}
+
+function computeLifecycleStatus(order, config) {
+  if (order.status === 'delivered') return 'delivered';
+  if (order.status === 'returned') return 'returned';
+  if (order.status === 'partial_returned') return 'partial_returned';
+  // Đã giải quyết xong -> tự động loại khỏi cảnh báo rủi ro / nghi ngờ mất
+  if (order.claimStatus === 'resolved') return 'delivered';
+
+  const days = calculateOrderTotalDays(order.sentDate);
+  order.totalDays = days;
+
+  if (days >= config.lostDaysThreshold) {
+    return 'suspected_lost';
+  }
+  if (days >= config.riskDaysThreshold) {
+    return 'risk_delayed';
+  }
+  return 'in_transit';
+}
+
+function computeTrackingStats(orders, config) {
+  const stats = {
+    totalTracked: orders.length,
+    inTransitCount: 0,
+    riskDelayedCount: 0,
+    suspectedLostCount: 0,
+    deliveredCount: 0,
+    returnedCount: 0,
+    partialReturnedCount: 0,
+  };
+
+  for (const o of orders) {
+    const st = computeLifecycleStatus(o, config);
+    if (st === 'delivered') stats.deliveredCount++;
+    else if (st === 'returned') stats.returnedCount++;
+    else if (st === 'partial_returned') stats.partialReturnedCount++;
+    else if (st === 'suspected_lost') stats.suspectedLostCount++;
+    else if (st === 'risk_delayed') stats.riskDelayedCount++;
+    else stats.inTransitCount++;
+  }
+
+  return stats;
+}
+
+// GET /api/carrier/order-lifecycle
+app.get('/api/carrier/order-lifecycle', requireAuth, (req, res) => {
+  try {
+    const config = getTrackingConfig();
+    const orders = readJsonFile(TRACKING_DATA_FILE, []);
+
+    // Refresh days & status on the fly
+    for (const o of orders) {
+      o.totalDays = calculateOrderTotalDays(o.sentDate);
+      if (o.status !== 'delivered' && o.status !== 'returned' && o.status !== 'partial_returned') {
+        o.status = computeLifecycleStatus(o, config);
+        o.statusText = o.status === 'suspected_lost'
+          ? 'Nghi ngờ thất lạc (>20 ngày)'
+          : o.status === 'risk_delayed'
+          ? 'Cảnh báo rủi ro (13-20 ngày)'
+          : 'Đang giao';
+      }
+    }
+
+    const stats = computeTrackingStats(orders, config);
+    return res.json({ success: true, config, stats, orders });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/carrier/order-lifecycle/config
+app.post('/api/carrier/order-lifecycle/config', requireAuth, requireFinanceWrite, (req, res) => {
+  try {
+    const { riskDaysThreshold, lostDaysThreshold } = req.body || {};
+    const config = {
+      riskDaysThreshold: Math.max(1, parseInt(riskDaysThreshold, 10) || 13),
+      lostDaysThreshold: Math.max(2, parseInt(lostDaysThreshold, 10) || 20),
+    };
+    writeJsonFile(TRACKING_CONFIG_FILE, config);
+    return res.json({ success: true, config });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/carrier/order-lifecycle/sync
+app.post('/api/carrier/order-lifecycle/sync', requireAuth, requireFinanceWrite, (req, res) => {
+  try {
+    const { type, orders: inputOrders, carrierId = 'jnt' } = req.body || {};
+    if (!type || !Array.isArray(inputOrders)) {
+      return res.status(400).json({ success: false, error: 'Thiếu loại đồng bộ hoặc danh sách đơn' });
+    }
+
+    const config = getTrackingConfig();
+    const existingOrders = readJsonFile(TRACKING_DATA_FILE, []);
+    const orderMap = new Map();
+
+    for (const o of existingOrders) {
+      orderMap.set(String(o.waybill).trim().toUpperCase(), o);
+      if (o.originalWaybill) {
+        orderMap.set(String(o.originalWaybill).trim().toUpperCase(), o);
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const todayYmd = nowIso.slice(0, 10);
+    let updatedCount = 0;
+    let newCount = 0;
+
+    if (type === 'sent') {
+      // Nhập file đơn gửi mới
+      for (const item of inputOrders) {
+        const rawWb = String(item.waybill || item.trackingCode || '').trim();
+        if (!rawWb || rawWb.length < 4) continue;
+        const wbUpper = rawWb.toUpperCase();
+        const existing = orderMap.get(wbUpper);
+
+        const sentDate = item.sentDate || todayYmd;
+        const days = calculateOrderTotalDays(sentDate);
+
+        if (existing) {
+          existing.shopName = item.shopName || existing.shopName;
+          existing.shopPhone = item.shopPhone || existing.shopPhone;
+          existing.receiverName = item.receiverName || existing.receiverName;
+          existing.receiverPhone = item.receiverPhone || existing.receiverPhone;
+          existing.receiverAddress = item.receiverAddress || existing.receiverAddress;
+          existing.weight = item.weight || existing.weight;
+          existing.codAmount = item.codAmount !== undefined ? item.codAmount : existing.codAmount;
+          existing.lastUpdated = nowIso;
+          existing.rawSentData = item.rawData || existing.rawSentData;
+          updatedCount++;
+        } else {
+          const newItem = {
+            id: `trk_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            waybill: rawWb,
+            originalWaybill: rawWb,
+            isPartialReturn: false,
+            carrierId,
+            shopId: item.shopId || '',
+            shopName: item.shopName || '',
+            shopPhone: item.shopPhone || '',
+            receiverName: item.receiverName || 'Khách nhận',
+            receiverPhone: item.receiverPhone || '',
+            receiverAddress: item.receiverAddress || '',
+            productName: item.productName || '',
+            weight: Number(item.weight) || 0.5,
+            codAmount: Number(item.codAmount) || 0,
+            sentDate,
+            status: days >= config.lostDaysThreshold ? 'suspected_lost' : days >= config.riskDaysThreshold ? 'risk_delayed' : 'in_transit',
+            statusText: days >= config.lostDaysThreshold ? 'Nghi ngờ thất lạc (>20 ngày)' : days >= config.riskDaysThreshold ? 'Cảnh báo rủi ro (13-20 ngày)' : 'Đang giao',
+            totalDays: days,
+            claimStatus: 'unclaimed',
+            lastUpdated: nowIso,
+            rawSentData: item.rawData,
+          };
+          orderMap.set(wbUpper, newItem);
+          existingOrders.push(newItem);
+          newCount++;
+        }
+      }
+    } else if (type === 'delivered') {
+      // Nhập file đơn giao thành công (gạch nợ / đóng an toàn)
+      for (const item of inputOrders) {
+        const rawWb = String(item.waybill || item.trackingCode || '').trim().toUpperCase();
+        if (!rawWb) continue;
+        const target = orderMap.get(rawWb);
+        if (target) {
+          target.status = 'delivered';
+          target.statusText = 'Giao thành công';
+          target.completedDate = item.completedDate || todayYmd;
+          target.lastUpdated = nowIso;
+          target.rawCompletedData = item.rawData;
+          updatedCount++;
+        }
+      }
+    } else if (type === 'returned') {
+      // Nhập file đơn hoàn & hoàn 1 phần (-001)
+      for (const item of inputOrders) {
+        const rawWb = String(item.waybill || item.trackingCode || '').trim();
+        if (!rawWb) continue;
+        const isPartial = /[-_]\s*0*1$/i.test(rawWb);
+        const originalWb = rawWb.replace(/[-_]\s*0*1$/i, '').trim().toUpperCase();
+        const target = orderMap.get(originalWb) || orderMap.get(rawWb.toUpperCase());
+
+        if (target) {
+          target.status = isPartial ? 'partial_returned' : 'returned';
+          target.statusText = isPartial ? 'Hoàn 1 phần (-001)' : 'Đã hoàn về kho';
+          target.isPartialReturn = isPartial;
+          target.returnedDate = item.returnedDate || todayYmd;
+          target.lastUpdated = nowIso;
+          target.rawReturnedData = item.rawData;
+          updatedCount++;
+        } else {
+          // Chưa có trong đơn gửi nhưng có trong file hoàn -> tạo mới dạng hoàn
+          const days = calculateOrderTotalDays(item.sentDate || todayYmd);
+          const newItem = {
+            id: `trk_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            waybill: rawWb,
+            originalWaybill: originalWb,
+            isPartialReturn: isPartial,
+            carrierId,
+            shopName: item.shopName || '',
+            receiverName: item.receiverName || '',
+            sentDate: item.sentDate || todayYmd,
+            returnedDate: todayYmd,
+            status: isPartial ? 'partial_returned' : 'returned',
+            statusText: isPartial ? 'Hoàn 1 phần (-001)' : 'Đã hoàn về kho',
+            totalDays: days,
+            claimStatus: 'unclaimed',
+            lastUpdated: nowIso,
+            rawReturnedData: item.rawData,
+          };
+          orderMap.set(rawWb.toUpperCase(), newItem);
+          orderMap.set(originalWb, newItem);
+          existingOrders.push(newItem);
+          newCount++;
+        }
+      }
+    }
+
+    writeJsonFile(TRACKING_DATA_FILE, existingOrders);
+    const stats = computeTrackingStats(existingOrders, config);
+
+    return res.json({
+      success: true,
+      message: `Đã đồng bộ thành công! Thêm mới: ${newCount} đơn, Cập nhật: ${updatedCount} đơn`,
+      stats,
+      orders: existingOrders,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/carrier/order-lifecycle/claim
+app.post('/api/carrier/order-lifecycle/claim', requireAuth, requireFinanceWrite, (req, res) => {
+  try {
+    const { waybills, claimStatus, claimNote } = req.body || {};
+    if (!Array.isArray(waybills) || waybills.length === 0) {
+      return res.status(400).json({ success: false, error: 'Thiếu danh sách mã vận đơn' });
+    }
+    const wbSet = new Set(waybills.map(w => String(w).trim().toUpperCase()));
+    const config = readJsonFile(TRACKING_CONFIG_FILE, { riskDaysThreshold: 13, lostDaysThreshold: 20 });
+    const orders = readJsonFile(TRACKING_DATA_FILE, []);
+    let modified = 0;
+    const nowIso = new Date().toISOString();
+
+    for (const o of orders) {
+      if (wbSet.has(String(o.waybill).toUpperCase()) || wbSet.has(String(o.originalWaybill).toUpperCase())) {
+        if (claimStatus) o.claimStatus = claimStatus;
+        if (claimNote !== undefined) o.claimNote = claimNote;
+        o.lastUpdated = nowIso;
+        o.status = computeLifecycleStatus(o, config);
+        modified++;
+      }
+    }
+
+    writeJsonFile(TRACKING_DATA_FILE, orders);
+    const stats = computeTrackingStats(orders, config);
+    return res.json({ success: true, message: `Đã cập nhật trạng thái khiếu nại cho ${modified} đơn`, modified, stats, orders });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/carrier/order-lifecycle/clear
+app.post('/api/carrier/order-lifecycle/clear', requireAuth, requireAdmin, (req, res) => {
+  try {
+    const { waybills, clearAll } = req.body || {};
+    let orders = readJsonFile(TRACKING_DATA_FILE, []);
+    if (clearAll) {
+      orders = [];
+    } else if (Array.isArray(waybills) && waybills.length > 0) {
+      const wbSet = new Set(waybills.map(w => String(w).trim().toUpperCase()));
+      orders = orders.filter(o => !wbSet.has(String(o.waybill).toUpperCase()) && !wbSet.has(String(o.originalWaybill).toUpperCase()));
+    }
+    writeJsonFile(TRACKING_DATA_FILE, orders);
+    const config = getTrackingConfig();
+    const stats = computeTrackingStats(orders, config);
+    return res.json({ success: true, stats, orders });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Serve frontend static build (Hỗ trợ cả In-Memory Virtual Bundle cho Standalone Binary lẫn static folder ngoài đĩa)
+const virtualDist = globalThis.__VIRTUAL_DIST__ || null;
+
+if (virtualDist && typeof virtualDist === 'object') {
+  app.use((req, res, next) => {
+    let p = req.path;
+    if (p === '/' || p === '') p = '/index.html';
+    const asset = virtualDist[p];
+    if (asset) {
+      if (asset.mime) res.setHeader('Content-Type', asset.mime);
+      if (p.startsWith('/assets/')) {
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      }
+      return res.send(Buffer.from(asset.data, 'base64'));
+    }
+    next();
+  });
+
+  // Fallback for SPA Routing
+  app.use((req, res) => {
+    const indexAsset = virtualDist['/index.html'];
+    if (indexAsset) {
+      if (indexAsset.mime) res.setHeader('Content-Type', indexAsset.mime);
+      res.setHeader('Cache-Control', 'no-cache');
+      return res.send(Buffer.from(indexAsset.data, 'base64'));
+    }
+    res.status(404).send('Resource not found');
+  });
+} else {
+  const distPath = fs.existsSync(path.join(APP_ROOT, 'dist'))
+    ? path.join(APP_ROOT, 'dist')
+    : path.join(__dirname, 'dist');
+
+  if (fs.existsSync(distPath)) {
+    // Phục vụ các tài nguyên tĩnh trong /assets/ với cache dài hạn 1 năm (R3)
+    app.use('/assets', express.static(path.join(distPath, 'assets'), {
+      maxAge: 31536000000,
+      immutable: true,
+      setHeaders: (res) => {
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      }
+    }));
+    app.use(express.static(distPath, {
+      setHeaders: (res, filePath) => {
+        if (filePath.includes(path.sep + 'assets' + path.sep) || filePath.includes('/assets/')) {
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        }
+      }
+    }));
+    app.use((req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    app.use((req, res) => {
+      res.status(404).send('Frontend dist folder not found.');
+    });
+  }
+}
+
+// ──────────────────────────────────────────
+// 🚀 KHỞI ĐỘNG SERVER BẢO VỆ BẢN QUYỀN
+// ──────────────────────────────────────────
+const cliArgs = process.argv.slice(2);
+let forcedKey = null;
+let forcedAppId = null;
+let isActivateOnly = false;
+let isShowHwidOnly = false;
+
+for (const arg of cliArgs) {
+  if (arg.startsWith('--key=')) {
+    forcedKey = arg.slice(6);
+  } else if (arg.startsWith('--app-id=')) {
+    forcedAppId = arg.slice(9);
+  } else if (arg === '--activate') {
+    isActivateOnly = true;
+  }
+}
+
+async function bootstrap() {
+  try {
+    // 1. Chỉ bắt buộc kiểm tra và kích hoạt bản quyền LicenseHub nếu chạy dạng standalone binary (pkg) hoặc có license.json / LICENSE_KEY
+    const hasLicenseConfig = Boolean(process.pkg || process.env.LICENSE_KEY || fs.existsSync(path.join(DATA_DIR, 'license.json')) || forcedKey);
+    if (hasLicenseConfig) {
+      await enforceLicenseProtection({
+        dataDir: DATA_DIR,
+        forcedKey,
+        forcedAppId
+      });
+
+      if (isActivateOnly) {
+        console.log('🎉 [BẢN QUYỀN]: Thiết bị đã được kích hoạt thành công trên LicenseHub!');
+        process.exit(0);
+      }
+    }
+
+    // Khởi tạo sao lưu an toàn sau khi bản quyền hợp lệ
+    try {
+      createSnapshot('boot');
+      setInterval(() => {
+        createSnapshot('cron_6h');
+      }, 6 * 60 * 60 * 1000);
+    } catch (e) {
+      console.error('[Snapshot Warning]:', e.message);
+    }
+
+    // 2. Chỉ khi bản quyền hợp lệ mới cho phép server lắng nghe
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 GomDon Pro Enterprise server is running at http://0.0.0.0:${PORT}`);
+    });
+  } catch (err) {
+    console.error('❌ Lỗi nghiêm trọng khi khởi động:', err.message);
+    process.exit(1);
+  }
+}
+
+bootstrap();
+

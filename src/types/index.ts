@@ -283,6 +283,7 @@ export interface ReconciliationSession {
   totalCtvCommission?: number;  // Tổng hoa hồng chi trả CTV trong kỳ
   statements: ShopSettlementStatement[];
   unmatchedOrders: ReconciledOrder[];
+  skippedOrders?: ReconciledOrder[]; // Đơn chưa khớp được Admin "tạm bỏ qua" (không vào bảng kê, có thể khôi phục)
   payoutStatus?: PayoutStatus;
   totalPaidAmount?: number;
   totalRemainingDebt?: number;
@@ -411,3 +412,8 @@ export interface SecurityAuditLog {
   deviceName?: string;
   details?: string;
 }
+
+// ==========================================
+// QUẢN LÝ ỨNG COD HÀNG NGÀY (T+0) MODULE TYPES
+// ==========================================
+export * from './codAdvance';

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   Settings2, 
   Check, 
@@ -38,6 +38,82 @@ interface ActualFileColumn {
   origin: 'nvc' | 'app' | 'both';
 }
 
+function getInitialExportSettings(
+  carrierId?: string,
+  availableFileHeaders?: { nvcHeaders?: string[]; appHeaders?: string[] }
+): ExportColumnSettings {
+  if (carrierId) {
+    const saved = StorageService.getCarrierExportSettings(carrierId);
+    if (saved && saved.shopColumns && saved.shopColumns.length > 0) {
+      return saved;
+    }
+  }
+
+  const globalSaved = StorageService.getExportColumnSettings();
+  if (globalSaved && globalSaved.shopColumns && globalSaved.shopColumns.length > 0) {
+    return globalSaved;
+  }
+
+  // Default to ALL merged columns from 2 files
+  const nvcCols = (availableFileHeaders?.nvcHeaders || []).filter(h => h && h.trim());
+  const appCols = (availableFileHeaders?.appHeaders || []).filter(h => h && h.trim());
+  const discovered: ExportColumnItem[] = [];
+  const seen = new Set<string>();
+
+  discovered.push({ id: 'stt', label: 'STT', enabled: true, category: 'basic' });
+  seen.add('stt');
+
+  nvcCols.forEach(h => {
+    const t = h.trim();
+    const norm = t.toLowerCase();
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    discovered.push({
+      id: `nvc_${Math.random().toString(36).slice(2, 7)}`,
+      label: t,
+      sourceHeader: t,
+      enabled: true,
+      category: 'carrier',
+    });
+  });
+
+  appCols.forEach(h => {
+    const t = h.trim();
+    const cleanKey = t.replace(/\s*[-–]\s*[^\s].*$/, '').trim() || t;
+    const norm = cleanKey.toLowerCase();
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    discovered.push({
+      id: `app_${Math.random().toString(36).slice(2, 7)}`,
+      label: cleanKey,
+      sourceHeader: t,
+      enabled: true,
+      category: 'basic',
+    });
+  });
+
+  if (!seen.has('cước tính shop (vnđ)')) {
+    discovered.push({ id: 'shopFee', label: 'Cước Tính Shop (VNĐ)', enabled: true, category: 'finance' });
+  }
+  if (!seen.has('phụ phí shop (vnđ)')) {
+    discovered.push({ id: 'shopOtherFee', label: 'Phụ Phí Shop (VNĐ)', enabled: true, category: 'finance' });
+  }
+  if (!seen.has('thực chuyển cho shop (vnđ)')) {
+    discovered.push({ id: 'netPayout', label: 'Thực Chuyển Cho Shop (VNĐ)', enabled: true, category: 'finance' });
+  }
+
+  const masterList = [...discovered];
+  if (!seen.has('lợi nhuận gom đơn (vnđ)')) {
+    masterList.push({ id: 'profit', label: 'Lợi Nhuận Gom Đơn (VNĐ)', enabled: true, category: 'finance' });
+  }
+
+  if (discovered.length > 3) {
+    return { shopColumns: discovered, masterColumns: masterList };
+  }
+
+  return DEFAULT_EXPORT_COLUMNS;
+}
+
 export const ExportColumnConfigModal: React.FC<ExportColumnConfigModalProps> = ({
   isOpen,
   onClose,
@@ -49,73 +125,14 @@ export const ExportColumnConfigModal: React.FC<ExportColumnConfigModalProps> = (
   const { showConfirm } = useConfirm();
   const { showToast } = useToast();
   const [activeTab, setActiveTab] = useState<'shop' | 'master'>('shop');
-  const [settings, setSettings] = useState<ExportColumnSettings>(() => {
-    if (carrierId) {
-      const saved = StorageService.getCarrierExportSettings(carrierId);
-      if (saved && saved.shopColumns && saved.shopColumns.length > 0) {
-        return saved;
-      }
+  const [settings, setSettings] = useState<ExportColumnSettings>(() => getInitialExportSettings(carrierId, availableFileHeaders));
+
+  useEffect(() => {
+    if (isOpen) {
+      setSettings(getInitialExportSettings(carrierId, availableFileHeaders));
     }
+  }, [isOpen, carrierId]);
 
-    // Default to ALL merged columns from 2 files
-    const nvcCols = (availableFileHeaders?.nvcHeaders || []).filter(h => h && h.trim());
-    const appCols = (availableFileHeaders?.appHeaders || []).filter(h => h && h.trim());
-    const discovered: ExportColumnItem[] = [];
-    const seen = new Set<string>();
-
-    discovered.push({ id: 'stt', label: 'STT', enabled: true, category: 'basic' });
-    seen.add('stt');
-
-    nvcCols.forEach(h => {
-      const t = h.trim();
-      const norm = t.toLowerCase();
-      if (seen.has(norm) || t.includes('(chuẩn hóa')) return;
-      seen.add(norm);
-      discovered.push({
-        id: `nvc_${Math.random().toString(36).slice(2, 7)}`,
-        label: t,
-        sourceHeader: t,
-        enabled: true,
-        category: 'carrier',
-      });
-    });
-
-    appCols.forEach(h => {
-      const t = h.trim();
-      const cleanKey = t.replace(/\s*[-–]\s*[^\s].*$/, '').trim() || t;
-      const norm = cleanKey.toLowerCase();
-      if (seen.has(norm) || cleanKey.includes('(chuẩn hóa')) return;
-      seen.add(norm);
-      discovered.push({
-        id: `app_${Math.random().toString(36).slice(2, 7)}`,
-        label: cleanKey,
-        sourceHeader: t,
-        enabled: true,
-        category: 'basic',
-      });
-    });
-
-    if (!seen.has('cước tính shop (vnđ)')) {
-      discovered.push({ id: 'shopFee', label: 'Cước Tính Shop (VNĐ)', enabled: true, category: 'finance' });
-    }
-    if (!seen.has('phụ phí shop (vnđ)')) {
-      discovered.push({ id: 'shopOtherFee', label: 'Phụ Phí Shop (VNĐ)', enabled: true, category: 'finance' });
-    }
-    if (!seen.has('thực chuyển cho shop (vnđ)')) {
-      discovered.push({ id: 'netPayout', label: 'Thực Chuyển Cho Shop (VNĐ)', enabled: true, category: 'finance' });
-    }
-
-    const masterList = [...discovered];
-    if (!seen.has('lợi nhuận gom đơn (vnđ)')) {
-      masterList.push({ id: 'profit', label: 'Lợi Nhuận Gom Đơn (VNĐ)', enabled: true, category: 'finance' });
-    }
-
-    if (discovered.length > 3) {
-      return { shopColumns: discovered, masterColumns: masterList };
-    }
-
-    return StorageService.getExportColumnSettings();
-  });
   const [savedSuccess, setSavedSuccess] = useState(false);
   
   // Search & Filter state for selecting columns from the 2 files
@@ -349,9 +366,8 @@ export const ExportColumnConfigModal: React.FC<ExportColumnConfigModalProps> = (
       setSettings(defaultClone);
       if (carrierId) {
         StorageService.saveCarrierExportSettings(carrierId, defaultClone);
-      } else {
-        StorageService.saveExportColumnSettings(defaultClone);
       }
+      StorageService.saveExportColumnSettings(defaultClone);
       showToast('Đã khôi phục danh sách cột xuất mặc định!', 'success');
     }
   };
@@ -359,9 +375,8 @@ export const ExportColumnConfigModal: React.FC<ExportColumnConfigModalProps> = (
   const handleSave = () => {
     if (carrierId) {
       StorageService.saveCarrierExportSettings(carrierId, settings);
-    } else {
-      StorageService.saveExportColumnSettings(settings);
     }
+    StorageService.saveExportColumnSettings(settings);
     if (onSave) onSave(settings);
     setSavedSuccess(true);
     showToast('Đã lưu cấu hình cột xuất file Excel thành công!', 'success');

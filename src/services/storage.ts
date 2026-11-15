@@ -326,10 +326,18 @@ export const StorageService = {
       }
       if (emailSettings && Object.keys(emailSettings).length > 0) {
         const localSettings = this.getEmailSettings();
-        if (!emailSettings.emailPassword && localSettings.emailPassword) {
-          emailSettings.emailPassword = localSettings.emailPassword;
+        const mergedEmail: EmailSettings = {
+          ...DEFAULT_EMAIL_SETTINGS,
+          ...localSettings,
+          ...emailSettings,
+          subjectTemplate: emailSettings.subjectTemplate || localSettings.subjectTemplate || DEFAULT_EMAIL_SETTINGS.subjectTemplate,
+          bodyTemplate: emailSettings.bodyTemplate || localSettings.bodyTemplate || DEFAULT_EMAIL_SETTINGS.bodyTemplate,
+          autoAttachExcel: emailSettings.autoAttachExcel !== undefined ? emailSettings.autoAttachExcel : (localSettings.autoAttachExcel ?? DEFAULT_EMAIL_SETTINGS.autoAttachExcel),
+        };
+        if (!mergedEmail.emailPassword && localSettings.emailPassword) {
+          mergedEmail.emailPassword = localSettings.emailPassword;
         }
-        localStorage.setItem(EMAIL_SETTINGS_KEY, JSON.stringify(emailSettings));
+        localStorage.setItem(EMAIL_SETTINGS_KEY, JSON.stringify(mergedEmail));
       }
       if (zaloSettings && Object.keys(zaloSettings).length > 0) {
         localStorage.setItem(ZALO_ZNS_SETTINGS_KEY, JSON.stringify(zaloSettings));
@@ -500,17 +508,18 @@ export const StorageService = {
     return await postServerSync('/api/db/sessions/delete', { id: sessionId });
   },
 
-  async getSessionDetail(sessionId: string): Promise<ReconciliationSession | null> {
+  async getSessionDetail(sessionId: string, forceFresh: boolean = false): Promise<ReconciliationSession | null> {
     const currentSessions = this.getSessions();
     const existing = currentSessions.find(s => s.id === sessionId);
     
-    // Check if statements already have orders populated
+    // Check if statements already have orders populated and no unmatched orders lingering
     const hasOrders = existing?.statements?.some(st => (st.orders?.length || 0) > 0);
-    if (hasOrders && existing) {
+    const hasUnmatched = (existing?.unmatchedOrdersCount || 0) > 0 || (existing?.unmatchedOrders?.length || 0) > 0;
+    if (!forceFresh && hasOrders && existing && !hasUnmatched) {
       return existing;
     }
 
-    // Otherwise fetch on-demand from server (takes only 30ms for 1 session)
+    // Fetch on-demand from server (guarantees up-to-date authoritative state from DB)
     try {
       const authHeaders = getAuthHeaders();
       const res = await fetch(`/api/db/sessions/detail/${sessionId}`, { headers: authHeaders });
@@ -518,11 +527,13 @@ export const StorageService = {
         const data = await res.json();
         if (data.success && data.session) {
           const fullSession: ReconciliationSession = data.session;
-          // Update in-memory cache
+          // Update in-memory cache and session summaries
           if (_inMemorySessionsCache) {
             const idx = _inMemorySessionsCache.findIndex(s => s.id === sessionId);
             if (idx >= 0) {
               _inMemorySessionsCache[idx] = fullSession;
+            } else {
+              _inMemorySessionsCache.unshift(fullSession);
             }
           }
           return fullSession;
@@ -533,6 +544,33 @@ export const StorageService = {
     }
 
     return existing || null;
+  },
+
+  async autoMatchHistory(sessionId: string): Promise<{ success: boolean; matchedCount: number; remainingUnmatched: number; updatedSession?: ReconciliationSession; error?: string }> {
+    try {
+      const authHeaders = getAuthHeaders();
+      const res = await fetch('/api/reconciliation/auto-match-history', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        body: JSON.stringify({ sessionId }),
+      });
+      const data = await res.json();
+      if (data.success && data.updatedSession) {
+        // Update in-memory cache
+        if (_inMemorySessionsCache) {
+          const idx = _inMemorySessionsCache.findIndex(s => s.id === sessionId);
+          if (idx >= 0) {
+            _inMemorySessionsCache[idx] = data.updatedSession;
+          }
+        }
+      }
+      return data;
+    } catch (err: any) {
+      return { success: false, matchedCount: 0, remainingUnmatched: 0, error: err?.message || 'Lỗi kết nối máy chủ' };
+    }
   },
 
   clearAllData(): void {
@@ -573,7 +611,14 @@ export const StorageService = {
       return DEFAULT_EMAIL_SETTINGS;
     }
     try {
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      return {
+        ...DEFAULT_EMAIL_SETTINGS,
+        ...parsed,
+        subjectTemplate: parsed?.subjectTemplate || DEFAULT_EMAIL_SETTINGS.subjectTemplate,
+        bodyTemplate: parsed?.bodyTemplate || DEFAULT_EMAIL_SETTINGS.bodyTemplate,
+        autoAttachExcel: parsed?.autoAttachExcel !== undefined ? parsed.autoAttachExcel : DEFAULT_EMAIL_SETTINGS.autoAttachExcel,
+      };
     } catch {
       return DEFAULT_EMAIL_SETTINGS;
     }

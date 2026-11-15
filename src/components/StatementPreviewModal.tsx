@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   X, 
   Download, 
@@ -13,6 +13,7 @@ import {
 import type { ShopSettlementStatement } from '../types';
 import { ExcelService } from '../services/excelService';
 import { PdfService } from '../services/pdfService';
+import { PaginationControl } from './PaginationControl';
 
 interface StatementPreviewModalProps {
   statement: ShopSettlementStatement | null;
@@ -27,6 +28,20 @@ export const StatementPreviewModal: React.FC<StatementPreviewModalProps> = ({
   onOpenQr,
   onOpenEmail,
 }) => {
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+
+  useEffect(() => {
+    setPage(1);
+  }, [statement?.shopId, statement?.periodName]);
+
+  const pagedOrders = useMemo(() => {
+    if (!statement?.orders) return [];
+    if (pageSize <= 0) return statement.orders;
+    const start = (page - 1) * pageSize;
+    return statement.orders.slice(start, start + pageSize);
+  }, [statement?.orders, page, pageSize]);
+
   if (!statement) return null;
 
   const formatVND = (num: number) => new Intl.NumberFormat('vi-VN').format(num) + ' đ';
@@ -210,7 +225,7 @@ export const StatementPreviewModal: React.FC<StatementPreviewModalProps> = ({
               </span>
             </div>
 
-            <div className="table-container" style={{ maxHeight: 320, overflowY: 'auto' }}>
+            <div className="table-container" style={{ maxHeight: 320, overflowY: 'auto', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-md) var(--radius-md) 0 0' }}>
               <table className="data-table">
                 <thead>
                   <tr>
@@ -225,9 +240,9 @@ export const StatementPreviewModal: React.FC<StatementPreviewModalProps> = ({
                   </tr>
                 </thead>
                 <tbody>
-                  {statement.orders.map((order, idx) => (
+                  {pagedOrders.map((order, idx) => (
                     <tr key={order.id}>
-                      <td>{idx + 1}</td>
+                      <td>{(pageSize > 0 ? (page - 1) * pageSize : 0) + idx + 1}</td>
                       <td>
                         <strong className="mono" style={{ color: 'var(--primary)' }}>
                           {order.waybill}
@@ -257,6 +272,25 @@ export const StatementPreviewModal: React.FC<StatementPreviewModalProps> = ({
                   ))}
                 </tbody>
               </table>
+            </div>
+            <div style={{
+              border: '1px solid var(--border-color)',
+              borderTop: 'none',
+              borderRadius: '0 0 var(--radius-md) var(--radius-md)',
+              overflow: 'hidden'
+            }}>
+              <PaginationControl
+                currentPage={page}
+                totalItems={statement.orders.length}
+                pageSize={pageSize}
+                onPageChange={setPage}
+                onPageSizeChange={(newSize) => {
+                  setPageSize(newSize);
+                  setPage(1);
+                }}
+                pageSizeOptions={[50, 100, 200]}
+                itemName="đơn"
+              />
             </div>
           </div>
 

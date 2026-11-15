@@ -7,14 +7,17 @@ import {
   Settings, Eye, EyeOff, Server, HelpCircle, ExternalLink,
   Send, ShieldCheck as ShieldOk, MessageSquare,
   Zap, Bot, RotateCcw, Database, Download, Upload,
-  RefreshCcw, FolderArchive, Trash2, AlertTriangle, KeyRound
+  RefreshCcw, FolderArchive, Trash2, AlertTriangle, KeyRound,
+  Clock
 } from 'lucide-react';
 import type { CompanyInfo, EmailSettings, ZaloZnsSettings, TelegramSettings, UserAccount } from '../types';
+import type { OrderTrackingConfig } from '../types/codAdvance';
 import { StorageService } from '../services/storage';
 import { AuthService } from '../services/authService';
 import { EmailService } from '../services/emailService';
 import { TelegramService } from '../services/telegramService';
 import { ZaloZnsService } from '../services/zaloZnsService';
+import { CodAdvanceService } from '../services/codAdvanceService';
 import { UserManagementView } from './UserManagementView';
 import { useToast, useConfirm } from './UIFeedback';
 
@@ -30,13 +33,15 @@ interface SettingsModalProps {
   currentUser?: UserAccount;
   onSaved?: () => void;
   onNavigateTo?: (tab: string) => void;
+  initialTab?: SettingsTab;
 }
 
-type SettingsTab = 'company' | 'notifications' | 'backup' | 'security' | 'accounts' | 'audit' | 'guide';
+type SettingsTab = 'company' | 'notifications' | 'sla_tracking' | 'backup' | 'security' | 'accounts' | 'audit' | 'guide';
 
 const BASE_TABS: { id: SettingsTab; icon: React.ReactNode; label: string }[] = [
   { id: 'company', icon: <Building2 size={15} />, label: 'Công Ty' },
   { id: 'notifications', icon: <Send size={15} />, label: 'Gửi Thông Báo' },
+  { id: 'sla_tracking', icon: <Clock size={15} />, label: 'SLA Hàng Hoàn' },
   { id: 'backup', icon: <Database size={15} />, label: 'Sao Lưu Dữ Liệu' }, // ADMIN only
   { id: 'security', icon: <ShieldCheck size={15} />, label: 'Bảo Mật' },
   { id: 'accounts', icon: <Users size={15} />, label: 'Tài Khoản' }, // ADMIN only
@@ -143,6 +148,220 @@ const TabCompany: React.FC<{ onSaved?: () => void; isAdmin: boolean }> = ({ onSa
       {!isAdmin && (
         <div style={{ fontSize: 12, color: 'var(--text-dim)', display: 'flex', alignItems: 'center', gap: 5 }}>
           <Lock size={12} /> Chỉ Admin mới có thể chỉnh sửa thông tin này.
+        </div>
+      )}
+    </form>
+  );
+};
+
+
+/* ─────────────── TAB: CẤU HÌNH SLA TOÀN TRÌNH & HÀNG HOÀN ─────────────── */
+const TabSlaTracking: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
+  const { showToast } = useToast();
+  const [_config, setConfig] = useState<OrderTrackingConfig>({
+    riskDaysThreshold: 13,
+    lostDaysThreshold: 20,
+  });
+  const [tempRisk, setTempRisk] = useState<number>(13);
+  const [tempLost, setTempLost] = useState<number>(20);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
+
+  useEffect(() => {
+    setIsLoading(true);
+    CodAdvanceService.fetchOrderLifecycleApi()
+      .then((res) => {
+        if (res.config) {
+          setConfig(res.config);
+          setTempRisk(res.config.riskDaysThreshold || 13);
+          setTempLost(res.config.lostDaysThreshold || 20);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setIsLoading(false));
+  }, []);
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isAdmin) {
+      showToast('Chỉ Quản trị viên (Admin) mới có quyền chỉnh sửa cấu hình SLA.', 'warning');
+      return;
+    }
+    if (tempRisk < 1 || tempLost < 1) {
+      showToast('Số ngày SLA phải lớn hơn 0.', 'warning');
+      return;
+    }
+    if (tempLost <= tempRisk) {
+      showToast('Ngưỡng nghi ngờ thất lạc phải lớn hơn ngưỡng cảnh báo rủi ro!', 'warning');
+      return;
+    }
+
+    setIsSaving(true);
+    const newCfg: OrderTrackingConfig = {
+      riskDaysThreshold: Number(tempRisk),
+      lostDaysThreshold: Number(tempLost),
+    };
+    const ok = await CodAdvanceService.updateOrderTrackingConfigApi(newCfg);
+    setIsSaving(false);
+    if (ok) {
+      setConfig(newCfg);
+      showToast(`Đã lưu mốc SLA toàn trình: Rủi ro > ${newCfg.riskDaysThreshold} ngày, Thất lạc > ${newCfg.lostDaysThreshold} ngày`, 'success');
+    } else {
+      showToast('Không thể lưu cấu hình SLA', 'error');
+    }
+  };
+
+  return (
+    <form onSubmit={handleSave} style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+      {/* Introduction Card */}
+      <div style={{
+        padding: '14px 18px',
+        borderRadius: 12,
+        background: 'rgba(79, 70, 229, 0.05)',
+        border: '1.5px solid rgba(79, 70, 229, 0.2)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+      }}>
+        <div style={{
+          width: 38,
+          height: 38,
+          borderRadius: 10,
+          background: 'var(--primary)',
+          color: '#ffffff',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0,
+        }}>
+          <Clock size={20} />
+        </div>
+        <div>
+          <div style={{ fontWeight: 800, fontSize: 13.5, color: 'var(--text-main)' }}>
+            Cấu Hình SLA Toàn Trình & Cảnh Báo Thất Lạc (J&T Express)
+          </div>
+          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>
+            Quy định ngưỡng số ngày luân chuyển đơn hàng để hệ thống tự động gắn nhãn <strong>Đang giao</strong>, <strong>Cảnh báo rủi ro</strong> hoặc <strong>Nghi ngờ thất lạc</strong>.
+          </div>
+        </div>
+      </div>
+
+      {/* SLA Inputs Grid */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16 }}>
+        {/* Risk Threshold */}
+        <div style={{
+          padding: 16,
+          borderRadius: 12,
+          background: 'var(--bg-panel)',
+          border: '1.5px solid #f59e0b',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <span style={{ fontWeight: 800, fontSize: 12.5, color: '#d97706', display: 'flex', alignItems: 'center', gap: 5 }}>
+              ⚠️ Cảnh Báo Rủi Ro (Chậm SLA)
+            </span>
+            <span className="badge" style={{ background: '#fef3c7', color: '#b45309', fontSize: 10, fontWeight: 700 }}>
+              Mức 1
+            </span>
+          </div>
+          <p style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 12, minHeight: 34 }}>
+            Đơn gửi đi quá số ngày này mà chưa phát thành công hoặc chưa hoàn về kho (J&T thường 3 ngày giao + 7 ngày lưu kho).
+          </p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="number"
+              min={1}
+              max={60}
+              value={tempRisk}
+              onChange={(e) => setTempRisk(parseInt(e.target.value, 10) || 1)}
+              disabled={!isAdmin || isLoading}
+              className="input-field"
+              style={{
+                width: 80,
+                fontWeight: 800,
+                fontSize: 15,
+                textAlign: 'center',
+                borderColor: '#f59e0b',
+                color: '#d97706',
+              }}
+            />
+            <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--text-main)' }}>ngày gửi</span>
+          </div>
+        </div>
+
+        {/* Lost Threshold */}
+        <div style={{
+          padding: 16,
+          borderRadius: 12,
+          background: 'var(--bg-panel)',
+          border: '1.5px solid var(--danger)',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <span style={{ fontWeight: 800, fontSize: 12.5, color: 'var(--danger)', display: 'flex', alignItems: 'center', gap: 5 }}>
+              🚨 Nghi Ngờ Thất Lạc (Mất Hàng)
+            </span>
+            <span className="badge badge-danger" style={{ fontSize: 10, fontWeight: 700 }}>
+              Mức 2
+            </span>
+          </div>
+          <p style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 12, minHeight: 34 }}>
+            Đơn vượt quá mốc này sẽ được đưa vào danh sách xuất <strong>Biên bản khiếu nại bồi thường</strong> cho NVC J&T.
+          </p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="number"
+              min={2}
+              max={90}
+              value={tempLost}
+              onChange={(e) => setTempLost(parseInt(e.target.value, 10) || 2)}
+              disabled={!isAdmin || isLoading}
+              className="input-field"
+              style={{
+                width: 80,
+                fontWeight: 800,
+                fontSize: 15,
+                textAlign: 'center',
+                borderColor: 'var(--danger)',
+                color: 'var(--danger)',
+              }}
+            />
+            <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--text-main)' }}>ngày gửi</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Explanatory Box */}
+      <div style={{
+        padding: '12px 16px',
+        borderRadius: 10,
+        background: 'var(--bg-tertiary)',
+        border: '1px solid var(--border-color)',
+        fontSize: 11.5,
+        color: 'var(--text-muted)',
+        lineHeight: 1.6,
+      }}>
+        <strong>💡 Lưu ý quy tắc kiểm soát đơn J&T:</strong>
+        <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+          <li>Từ ngày gửi đến ngưỡng cảnh báo: trạng thái là <strong>Đang giao</strong>.</li>
+          <li>Đơn hoàn toàn phần: mã vận đơn trùng mã gửi ban đầu.</li>
+          <li>Đơn hoàn 1 phần (ký 1 phần): bưu cục J&T tự động nối đuôi <code style={{ color: 'var(--primary)', fontWeight: 700 }}>-001</code>. Hệ thống tự động cắt đuôi để khớp chính xác về đơn gửi gốc.</li>
+        </ul>
+      </div>
+
+      {isAdmin ? (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, paddingTop: 6 }}>
+          <button
+            type="submit"
+            disabled={isSaving || isLoading}
+            className="btn btn-primary"
+            style={{ fontWeight: 800, padding: '9px 24px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            {isSaving ? <RefreshCcw size={14} className="animate-spin" /> : <Check size={15} />}
+            <span>{isSaving ? 'Đang lưu...' : 'Lưu Cấu Hình SLA'}</span>
+          </button>
+        </div>
+      ) : (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-muted)', justifyContent: 'flex-end' }}>
+          <Lock size={12} /> Chỉ Admin mới có thể chỉnh sửa cấu hình này.
         </div>
       )}
     </form>
@@ -1666,15 +1885,21 @@ const TabAccounts: React.FC<{ currentUser?: UserAccount }> = ({ currentUser }) =
 
 /* ─────────────── MAIN MODAL ─────────────── */
 export const SettingsModal: React.FC<SettingsModalProps> = ({
-  isOpen, onClose, theme: _theme, setTheme: _setTheme, userRole = 'STAFF', currentUser, onSaved, onNavigateTo: _onNavigateTo,
+  isOpen, onClose, theme: _theme, setTheme: _setTheme, userRole = 'STAFF', currentUser, onSaved, onNavigateTo: _onNavigateTo, initialTab,
 }) => {
   const [activeTab, setActiveTab] = useState<SettingsTab>('company');
   const isAdmin = userRole === 'ADMIN';
   const TAB_LIST = isAdmin ? BASE_TABS : BASE_TABS.filter(t => t.id !== 'accounts' && t.id !== 'backup' && t.id !== 'audit');
 
   useEffect(() => {
-    if (isOpen) setActiveTab('company');
-  }, [isOpen]);
+    if (isOpen) {
+      if (initialTab) {
+        setActiveTab(initialTab);
+      } else {
+        setActiveTab('company');
+      }
+    }
+  }, [isOpen, initialTab]);
 
   if (!isOpen) return null;
 
@@ -1733,6 +1958,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div style={{ flex: 1, overflowY: 'auto', padding: (activeTab === 'accounts' || activeTab === 'audit') ? 16 : '20px 24px' }}>
           {activeTab === 'company' && <TabCompany onSaved={onSaved} isAdmin={isAdmin} />}
           {activeTab === 'notifications' && <TabNotifications />}
+          {activeTab === 'sla_tracking' && <TabSlaTracking isAdmin={isAdmin} />}
           {activeTab === 'backup' && isAdmin && <TabBackup onDataReloaded={onSaved} />}
           {activeTab === 'security' && (
             <TabSecurity 

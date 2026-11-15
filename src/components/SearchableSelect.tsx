@@ -39,6 +39,7 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
 
   // Close dropdown on outside click
   useEffect(() => {
+    if (!isOpen) return;
     const handleClickOutside = (e: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setIsOpen(false);
@@ -46,7 +47,7 @@ export const SearchableSelect: React.FC<SearchableSelectProps> = ({
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
+  }, [isOpen]);
 
   const selectedOption = options.find(o => o.value === value);
 

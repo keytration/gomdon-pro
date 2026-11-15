@@ -30,6 +30,7 @@ import {
   Edit3,
   X,
   History,
+  FileSearch,
 } from 'lucide-react';
 import type { 
   Shop, 
@@ -48,12 +49,15 @@ import { StatementPreviewModal } from './StatementPreviewModal';
 import { VietQRModal } from './VietQRModal';
 import { ColumnMappingModal } from './ColumnMappingModal';
 import { ExportColumnConfigModal } from './ExportColumnConfigModal';
+import { FileAuditInspectionModal } from './FileAuditInspectionModal';
 import { CarrierProfileConfigModal } from './CarrierProfileConfigModal';
 import { useToast, useConfirm } from './UIFeedback';
 import confetti from 'canvas-confetti';
 
 import { StorageService } from '../services/storage';
 import { AuditService } from '../services/auditService';
+import { PaginationControl } from './PaginationControl';
+import { useDebounce } from '../hooks/useDebounce';
 
 interface SearchableShopPickerProps {
   shops: Shop[];
@@ -66,22 +70,24 @@ function SearchableShopPicker({ shops, selectedShopId, onSelectShop, onAssign }:
   const [isOpen, setIsOpen] = useState(false);
   const [query, setQuery] = useState('');
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const debouncedQuery = useDebounce(query, 300);
 
   const activeShops = useMemo(() => shops.filter(s => s.active), [shops]);
   const selectedShop = useMemo(() => activeShops.find(s => s.id === selectedShopId), [activeShops, selectedShopId]);
 
   const filteredShops = useMemo(() => {
-    if (!query.trim()) return activeShops;
-    const q = query.trim().toLowerCase();
+    if (!debouncedQuery.trim()) return activeShops;
+    const q = debouncedQuery.trim().toLowerCase();
     return activeShops.filter(s =>
       s.name.toLowerCase().includes(q) ||
       s.code.toLowerCase().includes(q) ||
       (s.phone && s.phone.includes(q)) ||
       (s.nameAliases || []).some(a => a.toLowerCase().includes(q))
     );
-  }, [activeShops, query]);
+  }, [activeShops, debouncedQuery]);
 
   useEffect(() => {
+    if (!isOpen) return;
     function handleClickOutside(e: MouseEvent) {
       if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
         setIsOpen(false);
@@ -89,7 +95,7 @@ function SearchableShopPicker({ shops, selectedShopId, onSelectShop, onAssign }:
     }
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
+  }, [isOpen]);
 
   return (
     <div ref={wrapperRef} style={{ position: 'relative', display: 'inline-block' }}>
@@ -465,6 +471,7 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   const [showMappingModal, setShowMappingModal] = useState(false);
   const [, setIsMappingConfirmed] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
+  const [isFileAuditModalOpen, setIsFileAuditModalOpen] = useState(false);
   const [configCarrier, setConfigCarrier] = useState<CarrierWholesaleTier | null>(null);
   const [ghnSheets, setGhnSheets] = useState<{ name: string; rowCount: number }[]>([]);
   const [selectedGhnSheet, setSelectedGhnSheet] = useState('');
@@ -474,6 +481,16 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   const [searchShopQuery, setSearchShopQuery] = useState('');
   const [searchOrderQuery, setSearchOrderQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
+
+  // Debounced search queries for smooth keystrokes (R2)
+  const debouncedSearchShopQuery = useDebounce(searchShopQuery, 300);
+  const debouncedSearchOrderQuery = useDebounce(searchOrderQuery, 300);
+
+  // Pagination states for all reconciled orders and unmatched orders (R1)
+  const [allOrdersPage, setAllOrdersPage] = useState(1);
+  const [allOrdersPageSize, setAllOrdersPageSize] = useState(50);
+  const [unmatchedPage, setUnmatchedPage] = useState(1);
+  const [unmatchedPageSize, setUnmatchedPageSize] = useState(50);
 
   // Sorting
   const [sortField, setSortField] = useState<'name' | 'orders' | 'cod' | 'fee' | 'net' | 'profit'>('orders');
@@ -486,6 +503,16 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   // Unmatched manual assign map
   const [selectedAssignShops, setSelectedAssignShops] = useState<Record<string, string>>({});
   const [unmatchedSearchTerm, setUnmatchedSearchTerm] = useState('');
+  const debouncedUnmatchedSearchTerm = useDebounce(unmatchedSearchTerm, 300);
+
+  // Reset pagination on search / filter / session changes
+  useEffect(() => {
+    setAllOrdersPage(1);
+  }, [debouncedSearchOrderQuery, statusFilter, currentSession?.id]);
+
+  useEffect(() => {
+    setUnmatchedPage(1);
+  }, [debouncedUnmatchedSearchTerm, currentSession?.id]);
 
   // New shop pricing inputs (key = name|phone) — full plan per new shop
   const [newShopPricingMap, setNewShopPricingMap] = useState<Record<string, ShopPricingPlan>>({});
@@ -493,9 +520,9 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   const [newShopTestWeights, setNewShopTestWeights] = useState<Record<string, number>>({});
 
   const filteredUnmatchedOrders = useMemo(() => {
-    if (!currentSession) return [];
-    if (!unmatchedSearchTerm.trim()) return currentSession.unmatchedOrders;
-    const term = unmatchedSearchTerm.trim().toLowerCase();
+    if (!currentSession?.unmatchedOrders) return [];
+    if (!debouncedUnmatchedSearchTerm.trim()) return currentSession.unmatchedOrders;
+    const term = debouncedUnmatchedSearchTerm.trim().toLowerCase();
     return currentSession.unmatchedOrders.filter(o =>
       o.waybill.toLowerCase().includes(term) ||
       (o.shopName && o.shopName.toLowerCase().includes(term)) ||
@@ -504,7 +531,53 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
       (o.receiverPhone && o.receiverPhone.includes(term)) ||
       (o.productName && o.productName.toLowerCase().includes(term))
     );
-  }, [currentSession, unmatchedSearchTerm]);
+  }, [currentSession?.unmatchedOrders, debouncedUnmatchedSearchTerm]);
+
+  const pagedUnmatchedOrders = useMemo(() => {
+    if (unmatchedPageSize <= 0) return filteredUnmatchedOrders;
+    const start = (unmatchedPage - 1) * unmatchedPageSize;
+    return filteredUnmatchedOrders.slice(start, start + unmatchedPageSize);
+  }, [filteredUnmatchedOrders, unmatchedPage, unmatchedPageSize]);
+
+  useEffect(() => {
+    const maxPage = unmatchedPageSize <= 0 ? 1 : Math.max(1, Math.ceil(filteredUnmatchedOrders.length / unmatchedPageSize));
+    if (unmatchedPage > maxPage) {
+      setUnmatchedPage(maxPage);
+    }
+  }, [filteredUnmatchedOrders.length, unmatchedPageSize, unmatchedPage]);
+
+  // Memoized flattened and filtered reconciled orders for Tab 2
+  const allReconciledOrders = useMemo(() => {
+    if (!currentSession?.statements) return [];
+    return currentSession.statements.flatMap(s => s.orders);
+  }, [currentSession?.statements]);
+
+  const filteredAllOrders = useMemo(() => {
+    if (!allReconciledOrders) return [];
+    const q = debouncedSearchOrderQuery.trim().toLowerCase();
+    return allReconciledOrders.filter(order => {
+      const matchQuery = !q || (
+        order.waybill.toLowerCase().includes(q) ||
+        (order.shopName && order.shopName.toLowerCase().includes(q)) ||
+        (order.receiverPhone && order.receiverPhone.includes(q))
+      );
+      const matchStatus = statusFilter === 'ALL' || order.status === statusFilter;
+      return matchQuery && matchStatus;
+    });
+  }, [allReconciledOrders, debouncedSearchOrderQuery, statusFilter]);
+
+  const pagedAllOrders = useMemo(() => {
+    if (allOrdersPageSize <= 0) return filteredAllOrders;
+    const start = (allOrdersPage - 1) * allOrdersPageSize;
+    return filteredAllOrders.slice(start, start + allOrdersPageSize);
+  }, [filteredAllOrders, allOrdersPage, allOrdersPageSize]);
+
+  useEffect(() => {
+    const maxPage = allOrdersPageSize <= 0 ? 1 : Math.max(1, Math.ceil(filteredAllOrders.length / allOrdersPageSize));
+    if (allOrdersPage > maxPage) {
+      setAllOrdersPage(maxPage);
+    }
+  }, [filteredAllOrders.length, allOrdersPageSize, allOrdersPage]);
 
   // Step 2 Fast Preview KPI Stats
   const quickPreviewStats = useMemo(() => {
@@ -1121,17 +1194,34 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
 
       // 💾 Tự động lưu kỳ đối soát vào danh sách hệ thống
       await StorageService.saveSession(session);
+
+      // ⚡ TỰ ĐỘNG KHỚP THÔNG MINH NGAY LẬP TỨC NẾU CÒN ĐƠN CHƯA KHỚP
+      let finalSession = session;
+      if (session.unmatchedOrdersCount > 0) {
+        try {
+          const autoRes = await StorageService.autoMatchHistory(session.id);
+          if (autoRes.success && autoRes.updatedSession) {
+            finalSession = autoRes.updatedSession;
+            if (autoRes.matchedCount > 0) {
+              showToast(`⚡ Hệ thống đã tự động nhận diện & cứu khớp thành công ${autoRes.matchedCount.toLocaleString('vi-VN')} đơn từ lịch sử và mã shop!`, 'success');
+            }
+          }
+        } catch (autoErr) {
+          console.warn('[Auto-match initial background sync]:', autoErr);
+        }
+      }
+
       if (onRefreshSessions) {
         onRefreshSessions();
       }
 
-      setCurrentSession(session);
+      setCurrentSession(finalSession);
       setWizardStep(4);
       AuditService.logAction(
         currentUser.username,
         currentUser.role,
         'CREATE_RECONCILIATION_SESSION',
-        `Tạo kỳ “${session.sessionName}” (${session.carrierName}): ${session.matchedOrdersCount} đơn hợp lệ, ${session.unmatchedOrdersCount} đơn chờ kiểm tra, tổng cần trả ${session.totalNetPayout.toLocaleString('vi-VN')}đ.`
+        `Tạo kỳ “${finalSession.sessionName}” (${finalSession.carrierName}): ${finalSession.matchedOrdersCount} đơn hợp lệ, ${finalSession.unmatchedOrdersCount} đơn chờ kiểm tra, tổng cần trả ${finalSession.totalNetPayout.toLocaleString('vi-VN')}đ.`
       );
       setIsProcessing(false);
 
@@ -1245,6 +1335,35 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
     }
   };
 
+  // State & Handler: Auto-match unmatched orders using history sessions & Pancake S...O codes
+  const [isAutoMatching, setIsAutoMatching] = useState(false);
+
+  const handleAutoMatchHistory = async () => {
+    if (!currentSession || !currentSession.id) return;
+    const ok = await showConfirm({
+      title: '⚡ Tự Động Khớp Bổ Sung Từ Lịch Sử & Mã Shop',
+      message: `Hệ thống sẽ tra cứu toàn bộ lịch sử các kỳ đối soát cũ và đối chiếu tiền tố mã đơn khách hàng (S...O) để tự động nhận diện và gán đúng shop cho ${currentSession.unmatchedOrders.length} đơn chưa khớp. Bạn có muốn tiếp tục không?`,
+      confirmText: 'Bắt đầu khớp tự động',
+      cancelText: 'Hủy',
+    });
+    if (!ok) return;
+
+    setIsAutoMatching(true);
+    try {
+      const res = await StorageService.autoMatchHistory(currentSession.id);
+      if (res.success && res.updatedSession) {
+        setCurrentSession(res.updatedSession);
+        showToast(`Đã tự động khớp thành công ${res.matchedCount.toLocaleString('vi-VN')} đơn vào các Shop tương ứng! (Còn lại ${res.remainingUnmatched} đơn)`, 'success');
+      } else {
+        showToast(res.error || 'Không thể tự động khớp. Vui lòng thử lại.', 'error');
+      }
+    } catch (err: any) {
+      showToast(`Lỗi: ${err?.message || 'Không thể khớp tự động'}`, 'error');
+    } finally {
+      setIsAutoMatching(false);
+    }
+  };
+
   // Manually Assign Unmatched Order to a Shop
   const handleAssignUnmatchedOrder = (order: ReconciledOrder, targetShopId: string) => {
     if (!currentSession || !targetShopId) return;
@@ -1255,10 +1374,6 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
     }
     if (!isAdmin) {
       showToast('Chỉ Admin mới được phép gán thủ công đơn vào shop.', 'error');
-      return;
-    }
-    if (!order.canManualAssignShop) {
-      showToast('Không thể gán thủ công: đơn này có lỗi dữ liệu/đối soát cần được xử lý tại file hoặc cấu hình trước.', 'error');
       return;
     }
 
@@ -1398,12 +1513,131 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
     };
 
     setCurrentSession(updatedSession);
+    void persistUnmatchedChange(updatedSession);
     AuditService.logAction(
       currentUser.username,
       currentUser.role,
       'MANUAL_SHOP_ASSIGNMENT',
       `Gán thủ công vận đơn ${order.waybill} vào shop ${targetShop.code} (${targetShop.name}); tiền trả shop ${netShopPayout.toLocaleString('vi-VN')}đ.`
     );
+    showToast(`Đã gán vận đơn ${order.waybill} vào shop ${targetShop.name}.`, 'success');
+  };
+
+  // Lưu thay đổi danh sách đơn chưa khớp (gán / tạm bỏ qua / xoá / khôi phục).
+  // saveSession cập nhật cache RAM trước nên lần tải lại chi tiết kỳ sẽ không ghi đè thay đổi.
+  const persistUnmatchedChange = async (updatedSession: ReconciliationSession) => {
+    try {
+      const ok = await StorageService.saveSession(updatedSession);
+      if (!ok) {
+        showToast('Đã cập nhật trên máy nhưng chưa đồng bộ được lên máy chủ. Vui lòng kiểm tra kết nối và thử lại.', 'warning');
+      }
+    } catch (err) {
+      console.error('[Unmatched Persist Error]:', err);
+      showToast('Lỗi khi lưu thay đổi đơn chưa khớp lên máy chủ.', 'error');
+    }
+    onRefreshSessions?.();
+  };
+
+  const canEditUnmatched = (): boolean => {
+    if (!currentSession) return false;
+    if (!isAdmin) {
+      showToast('Chỉ Admin mới được phép xử lý đơn chưa khớp.', 'error');
+      return false;
+    }
+    const hasPayout = StorageService.getPaymentRecords().some(payment => !payment.voidedAt && payment.sessionId === currentSession.id);
+    if (hasPayout) {
+      showToast('Kỳ này đã phát sinh đi tiền nên bị khóa chỉnh sửa. Hãy hủy/đảo bản ghi đi tiền trước, sau đó mới điều chỉnh đối soát.', 'error');
+      return false;
+    }
+    return true;
+  };
+
+  // Tạm bỏ qua: chuyển đơn sang danh sách "đã bỏ qua" (không vào bảng kê, không chặn chốt kỳ), có thể khôi phục lại.
+  const handleSkipUnmatchedOrder = async (order: ReconciledOrder) => {
+    if (!currentSession || !canEditUnmatched()) return;
+    const ok = await showConfirm({
+      title: 'Tạm Bỏ Qua Đơn Chưa Khớp',
+      message: `Vận đơn ${order.waybill} (COD ${formatVND(order.codAmount)}) sẽ KHÔNG được đưa vào bảng kê của kỳ này. Đơn vẫn được lưu ở mục "Đơn đã tạm bỏ qua" và có thể khôi phục lại bất cứ lúc nào. Tiếp tục?`,
+      warning: false,
+    });
+    if (!ok) return;
+
+    const newUnmatched = currentSession.unmatchedOrders.filter(o => o.id !== order.id);
+    const updatedSession: ReconciliationSession = {
+      ...currentSession,
+      unmatchedOrders: newUnmatched,
+      unmatchedOrdersCount: newUnmatched.length,
+      totalOrders: Math.max(0, currentSession.totalOrders - 1),
+      skippedOrders: [...(currentSession.skippedOrders || []), order],
+    };
+    setCurrentSession(updatedSession);
+    await persistUnmatchedChange(updatedSession);
+    AuditService.logAction(
+      currentUser.username,
+      currentUser.role,
+      'SKIP_UNMATCHED_ORDER',
+      `Tạm bỏ qua vận đơn ${order.waybill} (COD ${order.codAmount.toLocaleString('vi-VN')}đ) khỏi kỳ ${currentSession.sessionName}.`
+    );
+    showToast(`Đã tạm bỏ qua vận đơn ${order.waybill}.`, 'success');
+  };
+
+  // Khôi phục đơn đã tạm bỏ qua về danh sách chưa khớp.
+  const handleRestoreSkippedOrder = async (order: ReconciledOrder) => {
+    if (!currentSession || !canEditUnmatched()) return;
+    const newSkipped = (currentSession.skippedOrders || []).filter(o => o.id !== order.id);
+    const newUnmatched = [...currentSession.unmatchedOrders, order];
+    const updatedSession: ReconciliationSession = {
+      ...currentSession,
+      unmatchedOrders: newUnmatched,
+      unmatchedOrdersCount: newUnmatched.length,
+      totalOrders: currentSession.totalOrders + 1,
+      skippedOrders: newSkipped,
+    };
+    setCurrentSession(updatedSession);
+    await persistUnmatchedChange(updatedSession);
+    AuditService.logAction(
+      currentUser.username,
+      currentUser.role,
+      'RESTORE_SKIPPED_ORDER',
+      `Khôi phục vận đơn ${order.waybill} về danh sách đơn chưa khớp của kỳ ${currentSession.sessionName}.`
+    );
+    showToast(`Đã khôi phục vận đơn ${order.waybill} về danh sách chưa khớp.`, 'info');
+  };
+
+  // Xoá hẳn đơn chưa khớp khỏi kỳ (không thể hoàn tác).
+  const handleDeleteUnmatchedOrder = async (order: ReconciledOrder, fromSkipped = false) => {
+    if (!currentSession || !canEditUnmatched()) return;
+    const ok = await showConfirm({
+      title: 'Xoá Đơn Khỏi Kỳ Đối Soát',
+      message: `Xoá vĩnh viễn vận đơn ${order.waybill} (COD ${formatVND(order.codAmount)}) khỏi kỳ "${currentSession.sessionName}"? Thao tác này KHÔNG thể hoàn tác. Nếu chỉ muốn tạm gác lại, hãy dùng "Tạm bỏ qua".`,
+      warning: true,
+    });
+    if (!ok) return;
+
+    let updatedSession: ReconciliationSession;
+    if (fromSkipped) {
+      updatedSession = {
+        ...currentSession,
+        skippedOrders: (currentSession.skippedOrders || []).filter(o => o.id !== order.id),
+      };
+    } else {
+      const newUnmatched = currentSession.unmatchedOrders.filter(o => o.id !== order.id);
+      updatedSession = {
+        ...currentSession,
+        unmatchedOrders: newUnmatched,
+        unmatchedOrdersCount: newUnmatched.length,
+        totalOrders: Math.max(0, currentSession.totalOrders - 1),
+      };
+    }
+    setCurrentSession(updatedSession);
+    await persistUnmatchedChange(updatedSession);
+    AuditService.logAction(
+      currentUser.username,
+      currentUser.role,
+      'DELETE_UNMATCHED_ORDER',
+      `Xoá vận đơn chưa khớp ${order.waybill} (COD ${order.codAmount.toLocaleString('vi-VN')}đ) khỏi kỳ ${currentSession.sessionName}.`
+    );
+    showToast(`Đã xoá vận đơn ${order.waybill} khỏi kỳ đối soát.`, 'success');
   };
 
   // Download All as ZIP
@@ -1432,16 +1666,27 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
   const sourceNvcFeeTotal = (currentSession?.totalNvcCost || 0) + unmatchedSourceNvcFee;
 
   // Sort statements
-  const sortedStatements = currentSession ? [...currentSession.statements].sort((a, b) => {
-    let diff = 0;
-    if (sortField === 'name') diff = a.shopName.localeCompare(b.shopName);
-    else if (sortField === 'orders') diff = a.totalOrders - b.totalOrders;
-    else if (sortField === 'cod') diff = a.totalCod - b.totalCod;
-    else if (sortField === 'fee') diff = a.totalShopFee - b.totalShopFee;
-    else if (sortField === 'net') diff = a.totalNetPayout - b.totalNetPayout;
-    else if (sortField === 'profit') diff = a.totalProfit - b.totalProfit;
-    return sortAsc ? diff : -diff;
-  }) : [];
+  const sortedStatements = useMemo(() => {
+    if (!currentSession?.statements) return [];
+    return [...currentSession.statements].sort((a, b) => {
+      let diff = 0;
+      if (sortField === 'name') diff = a.shopName.localeCompare(b.shopName);
+      else if (sortField === 'orders') diff = a.totalOrders - b.totalOrders;
+      else if (sortField === 'cod') diff = a.totalCod - b.totalCod;
+      else if (sortField === 'fee') diff = a.totalShopFee - b.totalShopFee;
+      else if (sortField === 'net') diff = a.totalNetPayout - b.totalNetPayout;
+      else if (sortField === 'profit') diff = a.totalProfit - b.totalProfit;
+      return sortAsc ? diff : -diff;
+    });
+  }, [currentSession?.statements, sortField, sortAsc]);
+
+  const filteredStatements = useMemo(() => {
+    if (!debouncedSearchShopQuery.trim()) return sortedStatements;
+    const q = debouncedSearchShopQuery.trim().toLowerCase();
+    return sortedStatements.filter(s =>
+      s.shopName.toLowerCase().includes(q) || s.shopCode.toLowerCase().includes(q)
+    );
+  }, [sortedStatements, debouncedSearchShopQuery]);
 
   const handleToggleSort = (field: 'name' | 'orders' | 'cod' | 'fee' | 'net' | 'profit') => {
     if (sortField === field) {
@@ -2865,10 +3110,75 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
       {wizardStep === 4 && currentSession && (currentSession.carrierId || 'jnt') === (activeCarrierId || selectedCarrierId) && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {currentSession.unmatchedOrdersCount > 0 && (
-            <div style={{ padding: '10px 14px', borderRadius: 'var(--radius-md)', border: '1px solid var(--danger-border)', background: 'var(--danger-bg)', display: 'flex', alignItems: 'center', gap: 8, color: 'var(--danger)' }}>
-              <AlertTriangle size={18} />
-              <div style={{ fontSize: 12.5 }}>
-                <strong>Chưa thể chốt hoặc xuất bảng kê.</strong> Có {currentSession.unmatchedOrdersCount} đơn chưa xác định được shop/trạng thái hoặc cần kiểm tra dữ liệu. Mở tab <strong>“Đơn Chưa Khớp”</strong> để xử lý trước.
+            <div style={{
+              padding: '12px 16px',
+              borderRadius: 'var(--radius-md)',
+              border: '1.5px solid var(--danger-border)',
+              background: 'var(--danger-bg)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: 12,
+              color: 'var(--danger)',
+              boxShadow: '0 2px 8px rgba(239, 68, 68, 0.08)'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, flex: 1, minWidth: 280 }}>
+                <AlertTriangle size={20} style={{ flexShrink: 0 }} />
+                <div>
+                  <strong>Chưa thể chốt hoặc xuất bảng kê.</strong> Có <span style={{ color: '#dc2626', fontWeight: 900, textDecoration: 'underline' }}>{currentSession.unmatchedOrdersCount.toLocaleString('vi-VN')} đơn chưa khớp</span>. Hệ thống đã chuẩn bị công cụ kiểm tra đối chiếu file và phân tích nguyên nhân.
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  onClick={() => setIsFileAuditModalOpen(true)}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: 8,
+                    background: '#ffffff',
+                    border: '1.5px solid #dc2626',
+                    color: '#dc2626',
+                    fontSize: 12.5,
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    boxShadow: '0 2px 6px rgba(220,38,38,0.12)',
+                    transition: 'all 0.2s ease',
+                  }}
+                  title="Kiểm tra đối chiếu các file tải lên, phát hiện file bị trùng, thiếu và phân tích nguyên nhân từng đơn"
+                >
+                  <FileSearch size={16} />
+                  <span>🔍 Tra Cứu File & Nguyên Nhân Lỗi</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleAutoMatchHistory}
+                  disabled={isAutoMatching}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: 8,
+                    background: 'linear-gradient(135deg, #dc2626 0%, #b91c1c 100%)',
+                    border: 'none',
+                    color: '#ffffff',
+                    fontSize: 12.5,
+                    fontWeight: 800,
+                    cursor: isAutoMatching ? 'not-allowed' : 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    boxShadow: '0 2px 8px rgba(220,38,38,0.3)',
+                    opacity: isAutoMatching ? 0.7 : 1,
+                  }}
+                  title="Tự động nhận diện Shop theo mã đơn Pancake, UPOS và lịch sử"
+                >
+                  <Sparkles size={16} />
+                  <span>{isAutoMatching ? 'Đang khớp...' : '⚡ Khớp Tự Động Ngay'}</span>
+                </button>
               </div>
             </div>
           )}
@@ -3267,6 +3577,33 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                   <span>Gửi Email Đối Soát</span>
                 </button>
 
+                {/* Nút Tra cứu & Chẩn đoán file lỗi */}
+                {currentSession.unmatchedOrdersCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setIsFileAuditModalOpen(true)}
+                    className="btn btn-sm"
+                    style={{
+                      fontSize: 11,
+                      padding: '6px 8px',
+                      fontWeight: 800,
+                      background: 'rgba(239, 68, 68, 0.1)',
+                      color: '#dc2626',
+                      border: '1.5px solid #ef4444',
+                      borderRadius: 6,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 4,
+                      cursor: 'pointer',
+                    }}
+                    title="Mở công cụ phân tích và tra cứu chi tiết nguồn gốc file, trùng file và nguyên nhân từng đơn lỗi"
+                  >
+                    <FileSearch size={12} color="#dc2626" />
+                    <span>Chẩn Đoán File ({currentSession.unmatchedOrdersCount} lỗi)</span>
+                  </button>
+                )}
+
                 {/* Nút Chuyển Sang Bước 5 Tổng Kết & Hoàn Tất Ngay Ở Phía Trên */}
                 <button
                   type="button"
@@ -3398,7 +3735,7 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                 </span>
               </button>
 
-              {currentSession.unmatchedOrdersCount > 0 && (
+              {(currentSession.unmatchedOrdersCount > 0 || (currentSession.skippedOrders?.length || 0) > 0) && (
                 <button
                   type="button"
                   onClick={() => setActiveResultTab('unmatched')}
@@ -3418,7 +3755,7 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                   }}
                 >
                   <AlertTriangle size={14} />
-                  <span>Đơn Chưa Khớp ({currentSession.unmatchedOrdersCount})</span>
+                  <span>Đơn Chưa Khớp ({currentSession.unmatchedOrdersCount}){(currentSession.skippedOrders?.length || 0) > 0 ? ` · Bỏ qua ${currentSession.skippedOrders!.length}` : ''}</span>
                 </button>
               )}
             </div>
@@ -3547,9 +3884,14 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedStatements
-                    .filter(s => s.shopName.toLowerCase().includes(searchShopQuery.toLowerCase()) || s.shopCode.toLowerCase().includes(searchShopQuery.toLowerCase()))
-                    .map((stmt, idx) => (
+                  {filteredStatements.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
+                        {searchShopQuery ? `Không tìm thấy Shop nào khớp với từ khóa "${searchShopQuery}"` : 'Không có dữ liệu bảng kê'}
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredStatements.map((stmt, idx) => (
                       <tr key={stmt.shopId}>
                         <td>{idx + 1}</td>
                         <td>
@@ -3641,7 +3983,8 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                           </div>
                         </td>
                       </tr>
-                    ))}
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>
@@ -3650,97 +3993,118 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
           {/* TAB 2: ALL RECONCILED ORDERS */}
           {activeResultTab === 'allOrders' && (
             <div 
-              className="table-container glass-panel" 
+              className="glass-panel" 
               style={{ 
-                maxHeight: 'min(560px, calc(100vh - 290px))', 
-                overflowY: 'auto',
                 border: '1.5px solid var(--border-color)',
                 borderRadius: 'var(--radius-md)',
                 boxShadow: '0 2px 10px rgba(0, 0, 0, 0.04)',
+                overflow: 'hidden',
+                display: 'flex',
+                flexDirection: 'column',
               }}
             >
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>STT</th>
-                    <th>Mã Vận Đơn</th>
-                    <th>Shop / Người Gửi</th>
-                    <th>Người Nhận & Địa Chỉ</th>
-                    <th>Khối Lượng</th>
-                    <th>Tiền COD</th>
-                    <th>Cước NVC</th>
-                    <th>Cước Thu Shop</th>
-                    <th>Lãi Gom</th>
-                    <th>Thực Trả Shop</th>
-                    <th>Trạng Thái</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {currentSession.statements
-                    .flatMap(s => s.orders)
-                    .filter(order => {
-                      const matchQuery = 
-                        order.waybill.toLowerCase().includes(searchOrderQuery.toLowerCase()) ||
-                        order.shopName.toLowerCase().includes(searchOrderQuery.toLowerCase()) ||
-                        order.receiverPhone.includes(searchOrderQuery);
-                      const matchStatus = statusFilter === 'ALL' || order.status === statusFilter;
-                      return matchQuery && matchStatus;
-                    })
-                    .map((order, idx) => (
-                      <tr key={order.id}>
-                        <td>{idx + 1}</td>
-                        <td>
-                          <strong className="mono" style={{ color: 'var(--primary)' }}>
-                            {order.waybill}
-                          </strong>
-                        </td>
-                        <td>
-                          <div style={{ fontWeight: 600 }}>{order.shopName}</div>
-                          <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{order.shopPhone}</div>
-                        </td>
-                        <td>
-                          <div>{order.receiverName} ({order.receiverPhone})</div>
-                          <div style={{ fontSize: 11, color: 'var(--text-dim)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {order.receiverAddress}
-                          </div>
-                        </td>
-                        <td>{order.weight} kg</td>
-                        <td className="mono">{formatVND(order.codAmount)}</td>
-                        <td className="mono" style={{ color: 'var(--text-dim)' }}>{formatVND(order.nvcBaseFee)}</td>
-                        <td className="mono" style={{ color: 'var(--warning)', fontWeight: 600 }}>
-                          {formatVND(order.shopCalculatedFee)}
-                        </td>
-                        <td className="mono" style={{ color: 'var(--primary)', fontWeight: 700 }}>
-                          +{formatVND(order.profitMargin)}
-                        </td>
-                        <td className="mono" style={{ color: 'var(--success)', fontWeight: 700 }}>
-                          {formatVND(order.netShopPayout)}
-                        </td>
-                        <td>
-                          <span className={`badge ${
-                            order.status === 'delivered' ? 'badge-success' : 
-                            order.status === 'returned' || order.status === 'returning' ? 'badge-danger' : 'badge-warning'
-                          }`}>
-                            {order.statusText || order.status}
-                          </span>
+              <div 
+                className="table-container"
+                style={{ 
+                  maxHeight: 'min(520px, calc(100vh - 330px))', 
+                  overflowY: 'auto',
+                }}
+              >
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>STT</th>
+                      <th>Mã Vận Đơn</th>
+                      <th>Shop / Người Gửi</th>
+                      <th>Người Nhận & Địa Chỉ</th>
+                      <th>Khối Lượng</th>
+                      <th>Tiền COD</th>
+                      <th>Cước NVC</th>
+                      <th>Cước Thu Shop</th>
+                      <th>Lãi Gom</th>
+                      <th>Thực Trả Shop</th>
+                      <th>Trạng Thái</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredAllOrders.length === 0 ? (
+                      <tr>
+                        <td colSpan={11} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
+                          {searchOrderQuery ? `Không tìm thấy đơn nào khớp với từ khóa "${searchOrderQuery}"` : 'Không có đơn hàng nào'}
                         </td>
                       </tr>
-                    ))}
-                </tbody>
-              </table>
+                    ) : (
+                      pagedAllOrders.map((order, idx) => (
+                        <tr key={order.id}>
+                          <td>{(allOrdersPageSize > 0 ? (allOrdersPage - 1) * allOrdersPageSize : 0) + idx + 1}</td>
+                          <td>
+                            <strong className="mono" style={{ color: 'var(--primary)' }}>
+                              {order.waybill}
+                            </strong>
+                          </td>
+                          <td>
+                            <div style={{ fontWeight: 600 }}>{order.shopName}</div>
+                            <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>{order.shopPhone}</div>
+                          </td>
+                          <td>
+                            <div>{order.receiverName} ({order.receiverPhone})</div>
+                            <div style={{ fontSize: 11, color: 'var(--text-dim)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {order.receiverAddress}
+                            </div>
+                          </td>
+                          <td>{order.weight} kg</td>
+                          <td className="mono">{formatVND(order.codAmount)}</td>
+                          <td className="mono" style={{ color: 'var(--text-dim)' }}>{formatVND(order.nvcBaseFee)}</td>
+                          <td className="mono" style={{ color: 'var(--warning)', fontWeight: 600 }}>
+                            {formatVND(order.shopCalculatedFee)}
+                          </td>
+                          <td className="mono" style={{ color: 'var(--primary)', fontWeight: 700 }}>
+                            +{formatVND(order.profitMargin)}
+                          </td>
+                          <td className="mono" style={{ color: 'var(--success)', fontWeight: 700 }}>
+                            {formatVND(order.netShopPayout)}
+                          </td>
+                          <td>
+                            <span className={`badge ${
+                              order.status === 'delivered' ? 'badge-success' : 
+                              order.status === 'returned' || order.status === 'returning' ? 'badge-danger' : 'badge-warning'
+                            }`}>
+                              {order.statusText || order.status}
+                            </span>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <PaginationControl
+                currentPage={allOrdersPage}
+                totalItems={filteredAllOrders.length}
+                pageSize={allOrdersPageSize}
+                onPageChange={setAllOrdersPage}
+                onPageSizeChange={(newSize) => {
+                  setAllOrdersPageSize(newSize);
+                  setAllOrdersPage(1);
+                }}
+                pageSizeOptions={[50, 100, 200]}
+                itemName="đơn"
+              />
             </div>
           )}
 
           {/* TAB 3: UNMATCHED ORDERS WITH MANUAL ASSIGN CAPABILITY */}
           {activeResultTab === 'unmatched' && (
             <div 
-              className="table-container glass-panel"
+              className="glass-panel"
               style={{ 
-                maxHeight: 'min(560px, calc(100vh - 290px))', 
-                overflowY: 'auto',
                 border: '1.5px solid var(--border-color)',
                 borderRadius: 'var(--radius-md)',
                 boxShadow: '0 2px 10px rgba(0, 0, 0, 0.04)',
+                overflow: 'hidden',
+                display: 'flex',
+                flexDirection: 'column',
               }}
             >
               <div style={{ padding: 16, background: 'var(--danger-bg)', borderBottom: '1px solid var(--danger-border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
@@ -3750,93 +4114,251 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
                     <span>Có {currentSession.unmatchedOrders.length} đơn chưa đủ điều kiện đưa vào bảng kê</span>
                   </div>
                   <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-                    Xem thông tin Shop/Người nhận đọc từ file bên dưới để chọn đúng Shop cần gán từ menu thả xuống.
+                    Bấm nút <strong>⚡ Khớp Tự Động</strong> để hệ thống đối chiếu lịch sử các kỳ trước &amp; mã đơn KH (S...O), hoặc chọn đúng Shop cần gán từ menu thả xuống.
                   </p>
                 </div>
 
-                <div style={{ minWidth: 260 }}>
-                  <input
-                    type="text"
-                    placeholder="🔍 Tìm mã đơn, tên/SĐT shop hoặc khách..."
-                    value={unmatchedSearchTerm}
-                    onChange={(e) => setUnmatchedSearchTerm(e.target.value)}
-                    className="input-field"
-                    style={{ padding: '6px 12px', fontSize: 12, width: '100%', borderRadius: 'var(--radius-md)' }}
-                  />
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    onClick={() => setIsFileAuditModalOpen(true)}
+                    className="btn"
+                    style={{
+                      padding: '7px 14px',
+                      fontSize: 12.5,
+                      fontWeight: 800,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      background: '#ffffff',
+                      border: '1.5px solid #dc2626',
+                      color: '#dc2626',
+                      borderRadius: 8,
+                      cursor: 'pointer',
+                      boxShadow: '0 1px 4px rgba(220, 38, 38, 0.15)'
+                    }}
+                    title="Mở bảng tra cứu chi tiết nguồn gốc file, trùng lặp và nguyên nhân chưa khớp"
+                  >
+                    <FileSearch size={16} />
+                    <span>🔍 Tra Cứu File & Nguyên Nhân Lỗi</span>
+                  </button>
+
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      onClick={handleAutoMatchHistory}
+                      disabled={isAutoMatching}
+                      className="btn btn-primary"
+                      style={{
+                        padding: '7px 16px',
+                        fontSize: 12.5,
+                        fontWeight: 800,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        background: 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)',
+                        color: '#ffffff',
+                        boxShadow: '0 2px 8px rgba(79, 70, 229, 0.3)',
+                        borderRadius: 8,
+                        cursor: isAutoMatching ? 'not-allowed' : 'pointer',
+                        opacity: isAutoMatching ? 0.7 : 1,
+                      }}
+                      title="Tự động tra cứu lịch sử các kỳ đối soát cũ và nhận diện mã đơn khách hàng (S...O) để khớp ngay các đơn này"
+                    >
+                      <Sparkles size={16} />
+                      <span>{isAutoMatching ? 'Đang tự động khớp...' : '⚡ Khớp Tự Động Từ Lịch Sử & Mã Shop'}</span>
+                    </button>
+                  )}
+
+                  <div style={{ minWidth: 240 }}>
+                    <input
+                      type="text"
+                      placeholder="🔍 Tìm mã đơn, tên/SĐT shop hoặc khách..."
+                      value={unmatchedSearchTerm}
+                      onChange={(e) => setUnmatchedSearchTerm(e.target.value)}
+                      className="input-field"
+                      style={{ padding: '6px 12px', fontSize: 12, width: '100%', borderRadius: 'var(--radius-md)' }}
+                    />
+                  </div>
                 </div>
               </div>
 
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>STT</th>
-                    <th>Mã Vận Đơn</th>
-                    <th>Tên / SĐT Shop Đọc Từ File</th>
-                    <th>Người Nhận & Hàng Hóa</th>
-                    <th>Tiền COD</th>
-                    <th>Cước NVC</th>
-                    <th>Trạng Thái</th>
-                    <th>Gán Thủ Công Cho Shop</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredUnmatchedOrders.length === 0 ? (
+              <div 
+                className="table-container"
+                style={{ 
+                  maxHeight: 'min(520px, calc(100vh - 370px))', 
+                  overflowY: 'auto',
+                }}
+              >
+                <table className="data-table">
+                  <thead>
                     <tr>
-                      <td colSpan={8} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
-                        {unmatchedSearchTerm ? `Không tìm thấy đơn nào khớp với từ khóa "${unmatchedSearchTerm}"` : 'Không có đơn chưa khớp'}
-                      </td>
+                      <th>STT</th>
+                      <th>Mã Vận Đơn</th>
+                      <th>Tên / SĐT Shop Đọc Từ File</th>
+                      <th>Người Nhận & Hàng Hóa</th>
+                      <th>Tiền COD</th>
+                      <th>Cước NVC</th>
+                      <th>Trạng Thái</th>
+                      <th>Gán Thủ Công Cho Shop</th>
                     </tr>
-                  ) : (
-                    filteredUnmatchedOrders.map((order: ReconciledOrder, idx: number) => (
-                      <tr key={order.id}>
-                        <td>{idx + 1}</td>
-                        <td><strong className="mono" style={{ color: 'var(--danger)' }}>{order.waybill}</strong></td>
-                        <td>
-                          <div>
-                            <strong style={{ fontSize: 12, color: 'var(--text-main)' }}>{order.shopName || '-- Chưa có tên --'}</strong>
-                            {order.shopPhone && <div className="mono" style={{ fontSize: 11, color: 'var(--primary)' }}>📞 {order.shopPhone}</div>}
-                          </div>
-                        </td>
-                        <td>
-                          <div>
-                            <div style={{ fontSize: 12, fontWeight: 600 }}>{order.receiverName || 'Khách Nhận'} {order.receiverPhone ? `(${order.receiverPhone})` : ''}</div>
-                            {order.productName && <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>📦 {order.productName}</div>}
-                          </div>
-                        </td>
-                        <td className="mono">{formatVND(order.codAmount)}</td>
-                        <td className="mono">{formatVND(order.nvcBaseFee)}</td>
-                        <td>{order.statusText}</td>
-                        <td>
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                            {!isAdmin ? (
-                              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Chỉ Admin được phép gán thủ công</span>
-                            ) : (
-                              <>
-                                {order.matchError && (
-                                  <div style={{ fontSize: 11, color: 'var(--danger)', fontStyle: 'italic', maxWidth: 240 }}>
-                                    ⚠️ {order.matchError}
-                                  </div>
-                                )}
-                                <div style={{ marginTop: 2 }}>
-                                  <SearchableShopPicker
-                                    shops={shops}
-                                    selectedShopId={selectedAssignShops[order.id] || ''}
-                                    onSelectShop={(shopId) => setSelectedAssignShops({
-                                      ...selectedAssignShops,
-                                      [order.id]: shopId
-                                    })}
-                                    onAssign={() => handleAssignUnmatchedOrder(order, selectedAssignShops[order.id])}
-                                  />
-                                </div>
-                              </>
-                            )}
-                          </div>
+                  </thead>
+                  <tbody>
+                    {filteredUnmatchedOrders.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
+                          {unmatchedSearchTerm ? `Không tìm thấy đơn nào khớp với từ khóa "${unmatchedSearchTerm}"` : 'Không có đơn chưa khớp'}
                         </td>
                       </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
+                    ) : (
+                      pagedUnmatchedOrders.map((order: ReconciledOrder, idx: number) => (
+                        <tr key={order.id}>
+                          <td>{(unmatchedPageSize > 0 ? (unmatchedPage - 1) * unmatchedPageSize : 0) + idx + 1}</td>
+                          <td><strong className="mono" style={{ color: 'var(--danger)' }}>{order.waybill}</strong></td>
+                          <td>
+                            <div>
+                              <strong style={{ fontSize: 12, color: 'var(--text-main)' }}>{order.shopName || '-- Chưa có tên --'}</strong>
+                              {order.shopPhone && <div className="mono" style={{ fontSize: 11, color: 'var(--primary)' }}>📞 {order.shopPhone}</div>}
+                            </div>
+                          </td>
+                          <td>
+                            <div>
+                              <div style={{ fontSize: 12, fontWeight: 600 }}>{order.receiverName || 'Khách Nhận'} {order.receiverPhone ? `(${order.receiverPhone})` : ''}</div>
+                              {order.productName && <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>📦 {order.productName}</div>}
+                            </div>
+                          </td>
+                          <td className="mono">{formatVND(order.codAmount)}</td>
+                          <td className="mono">{formatVND(order.nvcBaseFee)}</td>
+                          <td>{order.statusText}</td>
+                          <td>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                              {!isAdmin ? (
+                                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Chỉ Admin được phép gán thủ công</span>
+                              ) : (
+                                <>
+                                  {order.matchError && (
+                                    <div style={{ fontSize: 11, color: 'var(--danger)', fontStyle: 'italic', maxWidth: 240 }}>
+                                      ⚠️ {order.matchError}
+                                    </div>
+                                  )}
+                                  <div style={{ marginTop: 2 }}>
+                                    <SearchableShopPicker
+                                      shops={shops}
+                                      selectedShopId={selectedAssignShops[order.id] || ''}
+                                      onSelectShop={(shopId) => setSelectedAssignShops({
+                                        ...selectedAssignShops,
+                                        [order.id]: shopId
+                                      })}
+                                      onAssign={() => handleAssignUnmatchedOrder(order, selectedAssignShops[order.id])}
+                                    />
+                                  </div>
+                                  <div style={{ display: 'flex', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSkipUnmatchedOrder(order)}
+                                      className="btn btn-secondary btn-sm"
+                                      style={{ padding: '4px 10px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}
+                                      title="Không đưa đơn này vào bảng kê kỳ này, có thể khôi phục lại sau"
+                                    >
+                                      <XCircle size={12} />
+                                      <span>Tạm bỏ qua</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteUnmatchedOrder(order)}
+                                      className="btn btn-sm"
+                                      style={{ padding: '4px 10px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--danger)', border: '1px solid var(--danger-border, #fecaca)', background: 'var(--danger-bg, #fef2f2)' }}
+                                      title="Xoá vĩnh viễn đơn này khỏi kỳ đối soát"
+                                    >
+                                      <Trash2 size={12} />
+                                      <span>Xoá</span>
+                                    </button>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <PaginationControl
+                currentPage={unmatchedPage}
+                totalItems={filteredUnmatchedOrders.length}
+                pageSize={unmatchedPageSize}
+                onPageChange={setUnmatchedPage}
+                onPageSizeChange={(newSize) => {
+                  setUnmatchedPageSize(newSize);
+                  setUnmatchedPage(1);
+                }}
+                pageSizeOptions={[50, 100, 200]}
+                itemName="đơn"
+              />
+
+              {(currentSession.skippedOrders?.length || 0) > 0 && (
+                <div style={{ borderTop: '1px solid var(--border-color)', padding: 16, background: 'var(--bg-secondary)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, fontSize: 13, color: 'var(--text-main)', marginBottom: 8 }}>
+                    <XCircle size={16} />
+                    <span>Đơn đã tạm bỏ qua ({currentSession.skippedOrders!.length}) — không nằm trong bảng kê kỳ này</span>
+                  </div>
+                  <div className="table-container" style={{ maxHeight: 260, overflowY: 'auto' }}>
+                    <table className="data-table">
+                      <thead>
+                        <tr>
+                          <th>STT</th>
+                          <th>Mã Vận Đơn</th>
+                          <th>Shop Đọc Từ File</th>
+                          <th>Tiền COD</th>
+                          <th>Trạng Thái</th>
+                          <th>Lý Do Chưa Khớp</th>
+                          <th>Thao Tác</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {currentSession.skippedOrders!.map((order: ReconciledOrder, idx: number) => (
+                          <tr key={order.id}>
+                            <td>{idx + 1}</td>
+                            <td><strong className="mono">{order.waybill}</strong></td>
+                            <td style={{ fontSize: 12 }}>{order.shopName || '-- Chưa có tên --'}</td>
+                            <td className="mono">{formatVND(order.codAmount)}</td>
+                            <td style={{ fontSize: 12 }}>{order.statusText}</td>
+                            <td style={{ fontSize: 11, color: 'var(--text-muted)', maxWidth: 240 }}>{order.matchError || '-'}</td>
+                            <td>
+                              {isAdmin ? (
+                                <div style={{ display: 'flex', gap: 6 }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRestoreSkippedOrder(order)}
+                                    className="btn btn-secondary btn-sm"
+                                    style={{ padding: '4px 10px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}
+                                  >
+                                    <RotateCcw size={12} />
+                                    <span>Khôi phục</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteUnmatchedOrder(order, true)}
+                                    className="btn btn-sm"
+                                    style={{ padding: '4px 10px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, color: 'var(--danger)', border: '1px solid var(--danger-border, #fecaca)', background: 'var(--danger-bg, #fef2f2)' }}
+                                  >
+                                    <Trash2 size={12} />
+                                    <span>Xoá</span>
+                                  </button>
+                                </div>
+                              ) : (
+                                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Chỉ Admin</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -4425,6 +4947,9 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
               nvcHeaders: Array.from(nvcSet),
               appHeaders: Array.from(appSet),
             }}
+            onSave={() => {
+              showToast('Cấu hình cột xuất đã được lưu và áp dụng thành công!', 'success');
+            }}
           />
         );
       })()}
@@ -4447,6 +4972,18 @@ export const ReconciliationView: React.FC<ReconciliationViewProps> = ({
         <VietQRModal
           statement={qrStatement}
           onClose={() => setQrStatement(null)}
+        />
+      )}
+
+      {/* File Audit & Inspection Modal */}
+      {isFileAuditModalOpen && currentSession && (
+        <FileAuditInspectionModal
+          isOpen={isFileAuditModalOpen}
+          onClose={() => setIsFileAuditModalOpen(false)}
+          session={currentSession}
+          shops={shops}
+          onAutoMatchAll={handleAutoMatchHistory}
+          isAutoMatching={isAutoMatching}
         />
       )}
 

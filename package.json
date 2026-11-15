@@ -8,12 +8,14 @@
     "build": "tsc -b && vite build",
     "start": "node server.js",
     "lint": "oxlint",
+    "package": "node scripts/build-package.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "@types/express": "^5.0.6",
     "@types/nodemailer": "^8.0.1",
     "canvas-confetti": "^1.9.4",
+    "compression": "^1.8.2",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "file-saver": "^2.0.5",
@@ -26,6 +28,7 @@
   },
   "devDependencies": {
     "@types/canvas-confetti": "^1.9.0",
+    "@types/compression": "^1.8.1",
     "@types/file-saver": "^2.0.7",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.17",

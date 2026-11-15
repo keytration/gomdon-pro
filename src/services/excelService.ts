@@ -88,13 +88,20 @@ export function saveBlobFile(blob: Blob, filename: string): void {
   }
 }
 
+export function isDateColumn(normLabel: string, normSrc?: string): boolean {
+  const combined = `${normLabel} ${normSrc || ''}`;
+  const isDateKeyword = combined.includes('ngay') || combined.includes('date') || combined.includes('thoi_gian');
+  const isExcluded = combined.includes('tien') || combined.includes('cuoc') || combined.includes('phi') || combined.includes('cod') || combined.includes('tra');
+  return isDateKeyword && !isExcluded;
+}
+
 function isValidRealHeader(headerName: string): boolean {
   if (!headerName) return false;
   const t = headerName.trim();
-  if (t.includes('(chuẩn hóa') || t.includes('đa file')) return false;
+  // Do NOT filter out multi-file canonical columns containing "(chuẩn hóa" or "đa file"
   if (/[-–]\s*(80\d{8,}|\d{8,}|0\d{8,})/.test(t)) return false;
   if (/[-–]\s*(Giao thành công|Đã lấy hàng|Hủy|Đang giao)/i.test(t)) return false;
-  if (t.length > 50) return false;
+  if (t.length > 80) return false;
   return true;
 }
 
@@ -109,7 +116,8 @@ export function buildDynamicColumnsFromOrders(
       ? (customExportSettings.masterColumns || customExportSettings.shopColumns || [])
       : (customExportSettings.shopColumns || []);
     
-    const enabled = cols.filter(c => c.enabled !== false && isValidRealHeader(c.label));
+    // Explicitly preserve all columns enabled by the user
+    const enabled = cols.filter(c => c.enabled !== false);
     if (enabled.length > 0) {
       return enabled;
     }
@@ -216,45 +224,131 @@ export function resolveOrderColumnValue(order: any, col: ExportColumnItem, idx: 
   if (normId === 'carrier' || normLabel.includes('don_vi_van_chuyen') || normLabel.includes('hang_van_chuyen') || normLabel.includes('nvc')) {
     return carrierName || order.carrierId || '';
   }
+  if (normId === 'matchstatus' || normLabel.includes('khop_shop') || normLabel.includes('tinh_trang_khop')) {
+    return order.matched ? 'Đã khớp Shop' : 'Chưa nhận diện Shop';
+  }
+
+  // 2. Direct lookup in raw data by sourceHeader, label, id FIRST (if specified by user)
+  const candidates = [col.sourceHeader, col.label, col.id].filter(Boolean) as string[];
+  for (const c of candidates) {
+    if (order.rawAppData && order.rawAppData[c] !== undefined && order.rawAppData[c] !== '') {
+      let val = order.rawAppData[c];
+      return isDateColumn(normLabel, normSrc) ? formatAnyDateValue(val) : val;
+    }
+    if (order.rawNvcData && order.rawNvcData[c] !== undefined && order.rawNvcData[c] !== '') {
+      let val = order.rawNvcData[c];
+      return isDateColumn(normLabel, normSrc) ? formatAnyDateValue(val) : val;
+    }
+  }
+
+  // 3. Phone numbers (Receiver phone vs Shop/Sender phone)
+  const isPhoneCol = normLabel.includes('sdt') || normLabel.includes('dien_thoai') || normLabel.includes('phone') || normLabel.includes('mobile');
+  if (isPhoneCol) {
+    const isSenderPhone = normLabel.includes('gui') || normLabel.includes('shop') || normId === 'shopphone' || normSrc.includes('gui') || normSrc.includes('shop');
+    if (isSenderPhone) {
+      return order.shopPhone ||
+        order.rawAppData?.['Số điện thoại di động của người gửi hàng'] ||
+        order.rawAppData?.['SĐT người gửi (chuẩn hóa đa file)'] ||
+        order.rawAppData?.['SĐT người gửi'] ||
+        order.rawAppData?.['Số điện thoại người gửi'] ||
+        extractRowField(order.rawAppData, order.rawNvcData, undefined, ['sdt_nguoi_gui', 'sdt_gui', 'so_dien_thoai_nguoi_gui', 'phone_shop', 'sdt_shop']) || '';
+    } else {
+      return order.receiverPhone ||
+        order.rawNvcData?.['Số điện thoại người nhận'] ||
+        order.rawAppData?.['SĐT người nhận'] ||
+        order.rawAppData?.['SĐT người nhận (chuẩn hóa đa file)'] ||
+        extractRowField(order.rawAppData, order.rawNvcData, undefined, ['sdt_nguoi_nhan', 'so_dien_thoai', 'phone', 'mobile', 'sdt']) || '';
+    }
+  }
+
+  // 4. Addresses (Receiver address vs Shop/Sender address)
+  const isAddressCol = normLabel.includes('dia_chi') || normLabel.includes('address') || normLabel.includes('dc_');
+  if (isAddressCol) {
+    const isSenderAddr = normLabel.includes('gui') || normLabel.includes('kho') || normId === 'shopaddress' || normSrc.includes('gui') || normSrc.includes('kho');
+    if (isSenderAddr) {
+      return order.shopAddress ||
+        order.rawAppData?.['Địa chỉ người gửi'] ||
+        order.rawAppData?.['Địa chỉ người gửi (chuẩn hóa đa file)'] ||
+        order.rawAppData?.['Địa chỉ kho'] ||
+        extractRowField(order.rawAppData, order.rawNvcData, undefined, ['dia_chi_gui', 'kho_gui', 'dia_chi_kho', 'dia_chi_nguoi_gui']) || '';
+    } else {
+      return order.receiverAddress ||
+        order.rawNvcData?.['Địa chỉ người nhận'] ||
+        order.rawAppData?.['Địa chỉ người nhận'] ||
+        order.rawAppData?.['Địa chỉ người nhận (chuẩn hóa đa file)'] ||
+        order.rawAppData?.['Địa chỉ hành chính'] ||
+        extractRowField(order.rawAppData, order.rawNvcData, undefined, ['dia_chi', 'address', 'dc_nhan', 'giao_hang', 'dia_chi_nhan', 'dc', 'dia_chi_giao', 'dia_chi_nguoi_nhan']) || '';
+    }
+  }
+
+  // 5. Sender Name / Shop Name (Ensure it's NOT a phone or address or code)
+  const isShopNameCol = normId === 'shopname' ||
+    normLabel.includes('ten_shop') ||
+    normLabel.includes('ten_nguoi_gui') ||
+    normLabel.includes('cua_hang') ||
+    (normLabel.includes('nguoi_gui') && !normLabel.includes('sdt') && !normLabel.includes('dia_chi') && !normLabel.includes('ma_'));
+  if (isShopNameCol) {
+    return order.rawAppData?.['Tên người gửi'] ||
+      order.rawAppData?.['Tên người gửi (chuẩn hóa đa file)'] ||
+      order.shopName ||
+      extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ten_nguoi_gui', 'ten_shop', 'cua_hang', 'nguoi_gui', 'shop_name']) || '';
+  }
+
+  // 6. Shop Code
+  if (normId === 'shopcode' || normLabel.includes('ma_shop') || normLabel.includes('ma_khach_hang')) {
+    return order.shopCode || order.shopId || order.rawAppData?.['Mã shop (chuẩn hóa đa file)'] || '';
+  }
+
+  // 7. Receiver Name
+  if (normId === 'receivername' || normLabel.includes('ten_nguoi_nhan') || normLabel.includes('nguoi_nhan') || normLabel.includes('ten_khach')) {
+    return order.receiverName ||
+      order.rawNvcData?.['Tên người nhận'] ||
+      order.rawAppData?.['Tên người nhận'] ||
+      order.rawAppData?.['Tên người nhận (chuẩn hóa đa file)'] ||
+      extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ten_nguoi_nhan', 'nguoi_nhan', 'ten_khach', 'receiver', 'nguoi_mua']) || '';
+  }
+
+  // 8. Financial fields
   if (normId === 'codamount' || normLabel === 'tien_thu_ho_cod' || normLabel === 'tien_cod' || normLabel === 'cod' || normLabel.includes('tien_cod') || normLabel.includes('thu_ho')) {
     return order.codAmount ?? 0;
   }
-  if (normId === 'shopfee' || normLabel === 'cuoc_phi_van_chuyen' || normLabel === 'cuoc_thu_shop' || normLabel === 'cuoc_phi' || normLabel === 'phi_giao_hang' || normLabel === 'phi_dich_vu' || normLabel.includes('tien_cuoc') || normLabel.includes('cuoc_tinh_shop') || (normLabel.includes('cuoc') && !normLabel.includes('goc') && !normLabel.includes('nvc'))) {
+  if (normId === 'shopfee' || normLabel === 'cuoc_phi_van_chuyen' || normLabel === 'cuoc_thu_shop' || normLabel === 'cuoc_tinh_shop_vnd') {
     return (order.shopCalculatedFee !== undefined) ? order.shopCalculatedFee : (order.shopFee || 0);
   }
-  if (normId === 'shopotherfee' || normLabel === 'phi_khac_phu_thu_hoan' || normLabel === 'phu_thu' || normLabel === 'phi_khac' || normLabel === 'phi_hoan_hang') {
+  if (normId === 'shopotherfee' || normLabel === 'phu_phi_shop_vnd' || normLabel === 'phi_khac_phu_thu_hoan' || normLabel === 'phu_thu') {
     return order.shopOtherFee ?? 0;
   }
   if (normId === 'nvcfee' || normLabel === 'cuoc_goc_tra_nvc' || normLabel === 'cuoc_goc' || normLabel === 'cuoc_nvc') {
     return (order.nvcBaseFee || 0) + (order.nvcOtherFee || 0);
   }
-  if (normId === 'profit' || normLabel === 'lai_rong_nha_gom' || normLabel === 'loi_nhuan' || normLabel === 'lai_rong') {
+  if (normId === 'profit' || normLabel === 'lai_rong_nha_gom' || normLabel === 'loi_nhuan_gom_don_vnd' || normLabel === 'loi_nhuan' || normLabel === 'lai_rong') {
     return order.profitMargin ?? 0;
   }
-  if (normId === 'netpayout' || normLabel === 'so_tien_thuc_chuyen_shop' || normLabel === 'thuc_chuyen_cho_shop' || normLabel === 'thuc_chuyen' || normLabel === 'thuc_tra' || normLabel.includes('tong_doi_soat')) {
+  if (normId === 'netpayout' || normLabel === 'thuc_chuyen_cho_shop_vnd' || normLabel === 'so_tien_thuc_chuyen_shop' || normLabel === 'thuc_chuyen_cho_shop' || normLabel === 'thuc_chuyen' || normLabel === 'thuc_tra') {
     return order.netShopPayout ?? 0;
   }
+
+  // 9. Weight
   if (normId === 'weight' || normLabel === 'khoi_luong_kg' || normLabel === 'trong_luong_tinh_phi' || normLabel.includes('khoi_luong') || normLabel.includes('trong_luong') || normLabel.includes('can_nang')) {
     return order.weight ?? 0.5;
   }
+
+  // 10. Status
   if (normId === 'status' || normLabel === 'trang_thai_don_hang' || normLabel === 'trang_thai_van_don' || normLabel === 'trang_thai') {
-    return order.statusText || order.status || '';
+    return order.statusText || order.status || order.rawAppData?.['Trạng thái vận đơn'] || '';
   }
-  if (normId === 'receivername' || normLabel === 'ten_nguoi_nhan' || normLabel === 'nguoi_nhan' || normLabel.includes('nguoi_nhan') || normLabel.includes('ten_khach')) {
-    return order.receiverName || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ten_nguoi_nhan', 'nguoi_nhan', 'ten_khach', 'receiver', 'nguoi_mua']);
-  }
-  if (normId === 'receiverphone' || normLabel === 'sdt_nguoi_nhan' || normLabel === 'sdt_nhan' || normLabel.includes('sdt_nguoi_nhan') || normLabel.includes('so_dien_thoai_nguoi_nhan') || normLabel.includes('dien_thoai_nguoi_nhan')) {
-    return order.receiverPhone || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['sdt_nguoi_nhan', 'so_dien_thoai', 'phone', 'mobile', 'sdt']);
-  }
-  if (normId === 'receiveraddress' || normLabel === 'dia_chi_giao_hang' || normLabel === 'dia_chi_nhan' || normLabel === 'dia_chi_nguoi_nhan' || normLabel.includes('dia_chi_nhan') || normLabel.includes('dia_chi_giao') || normLabel.includes('dia_chi_nguoi_nhan')) {
-    return order.receiverAddress || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['dia_chi', 'address', 'dc_nhan', 'giao_hang', 'dia_chi_nhan', 'dc', 'dia_chi_giao', 'dia_chi_nguoi_nhan']);
-  }
+
+  // 11. Product Name / Goods content
   if (normId === 'productname' || normLabel === 'ten_san_pham_hang_hoa' || normLabel === 'noi_dung_hang_hoa' || normLabel.includes('san_pham') || normLabel.includes('hang_hoa') || normLabel.includes('noi_dung')) {
-    return order.productName || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ten_san_pham', 'hang_hoa', 'ten_hang', 'san_pham', 'noi_dung', 'mo_ta', 'product', 'items', 'noi_dung_hang_hoa']);
+    return order.productName || order.rawAppData?.['Nội dung hàng hóa'] || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ten_san_pham', 'hang_hoa', 'ten_hang', 'san_pham', 'noi_dung', 'mo_ta', 'product', 'items', 'noi_dung_hang_hoa']) || '';
   }
+
+  // 12. Reference Order Code
   if (normId === 'refordercode' || normLabel.includes('ma_don_phu') || normLabel.includes('ma_don_kh') || normLabel.includes('ma_don_khach_hang') || normLabel.includes('ma_don_ghn')) {
-    return order.rawAppData?.['Mã đơn phụ'] || order.rawAppData?.['Mã đơn hàng'] || order.rawNvcData?.['Mã đơn KH'] || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ma_don_phu', 'ma_don_kh', 'ma_don_khach_hang', 'ref', 'order_id', 'ma_don_ghn']);
+    return order.rawAppData?.['Mã đơn phụ'] || order.rawAppData?.['Mã đơn hàng'] || order.rawAppData?.['Mã đơn KH'] || order.rawNvcData?.['Mã đơn KH'] || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ma_don_phu', 'ma_don_kh', 'ma_don_khach_hang', 'ref', 'order_id', 'ma_don_ghn']) || '';
   }
+
+  // 13. Dates
   if (normId === 'date' || normLabel.includes('ngay_gui') || normLabel.includes('ngay_tao') || normLabel.includes('thoi_gian_tao') || normLabel.includes('ngay_doi_soat')) {
     const rawDate = order.rawNvcData?.['Ngày Gửi Hàng'] || order.rawNvcData?.['Ngày'] || order.rawAppData?.['Thời gian tạo đơn'] || order.rawAppData?.['Thời gian lấy hàng'] || order.rawAppData?.['Ngày'] || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ngay_gui', 'ngay_tao', 'ngay', 'date', 'thoi_gian_tao_don', 'thoi_gian_lay_hang', 'thoi_gian']);
     return formatAnyDateValue(rawDate);
@@ -263,27 +357,8 @@ export function resolveOrderColumnValue(order: any, col: ExportColumnItem, idx: 
     const rawDate = order.rawNvcData?.['Thời gian Ký Nhận'] || order.rawAppData?.['Thời gian ký nhận'] || extractRowField(order.rawAppData, order.rawNvcData, undefined, ['ngay_giao', 'ngay_tra', 'ky_nhan', 'thoi_gian_ky_nhan', 'ngay_giao_tra']);
     return formatAnyDateValue(rawDate);
   }
-  if (normId === 'shopname' || normLabel.includes('ten_shop') || normLabel.includes('cua_hang') || normLabel.includes('nguoi_gui')) {
-    return order.shopName;
-  }
-  if (normId === 'shopphone' || normLabel.includes('sdt_shop') || normLabel.includes('so_dt_shop') || normLabel.includes('phone_shop') || normLabel.includes('sdt_gui')) {
-    return order.shopPhone;
-  }
-  if (normId === 'shopaddress' || normLabel.includes('dia_chi_gui') || normLabel.includes('kho_gui') || normLabel.includes('dia_chi_kho')) {
-    return order.shopAddress;
-  }
-  if (normId === 'matchstatus' || normLabel.includes('khop_shop') || normLabel.includes('tinh_trang_khop')) {
-    return order.matched ? 'Đã khớp Shop' : 'Chưa nhận diện Shop';
-  }
 
-  // 2. Direct lookup in raw data by sourceHeader, label, id
-  const candidates = [col.sourceHeader, col.label, col.id].filter(Boolean) as string[];
-  for (const c of candidates) {
-    if (order.rawAppData && order.rawAppData[c] !== undefined && order.rawAppData[c] !== '') return order.rawAppData[c];
-    if (order.rawNvcData && order.rawNvcData[c] !== undefined && order.rawNvcData[c] !== '') return order.rawNvcData[c];
-  }
-
-  // 3. Normalized header lookup in raw data keys
+  // 14. Normalized header lookup in raw data keys
   const allRawData = [order.rawAppData, order.rawNvcData];
   for (const raw of allRawData) {
     if (!raw) continue;
@@ -291,10 +366,7 @@ export function resolveOrderColumnValue(order: any, col: ExportColumnItem, idx: 
       const normKey = normalizeHeader(key);
       if (normKey === normLabel || normKey === normSrc || normKey === normId) {
         let val = raw[key];
-        const strVal = String(val).trim().replace(',', '.');
-        const numVal = Number(strVal);
-        const isDateCol = normLabel.includes('ngay') || normLabel.includes('date') || normLabel.includes('thoi_gian');
-        if (isDateCol || (!isNaN(numVal) && numVal > 25000 && numVal < 75000)) {
+        if (isDateColumn(normLabel, normSrc)) {
           val = formatAnyDateValue(val);
         }
         return val;
@@ -355,28 +427,74 @@ const ghnNumber = (value: any) => {
 };
 
 function parseGhnCodTransferSheet(rawSheetData: any[][], sheetName: string): { rows: Record<string, any>[]; headers: string[] } | null {
-  for (let rowIndex = 1; rowIndex < Math.min(20, rawSheetData.length); rowIndex++) {
+  for (let rowIndex = 0; rowIndex < Math.min(30, rawSheetData.length); rowIndex++) {
     const rawSubHeaders = rawSheetData[rowIndex] || [];
-    const rawSuperHeaders = rawSheetData[rowIndex - 1] || [];
+    const rawSuperHeaders = rowIndex > 0 ? (rawSheetData[rowIndex - 1] || []) : [];
     const headers = rawSubHeaders.map(cell => normalizeHeader(String(cell || '')));
     const groupHeaders = rawSuperHeaders.map(cell => normalizeHeader(String(cell || '')));
-    const waybillIndex = headers.findIndex(header => header === 'ma_don_ghn');
-    const shopIndex = headers.findIndex(header => header === 'cua_hang');
-    const statusIndex = headers.findIndex(header => header === 'trang_thai');
-    const codIndex = groupHeaders.findIndex(header => header === 'tien_cod');
-    const settlementIndex = groupHeaders.findIndex(header => header === 'tong_doi_soat');
-    const feeIndexes = groupHeaders
-      .map((header, index) => (header === 'phi_dich_vu' || header.startsWith('phi_dich_vu')) ? index : -1)
-      .filter(index => index >= 0);
 
-    if (waybillIndex < 0 || shopIndex < 0 || statusIndex < 0 || codIndex < 0 || settlementIndex < 0 || feeIndexes.length < 1) continue;
+    // Helper to find column across both subheaders (current row) and superheaders (previous row)
+    const findCol = (predicate: (h: string) => boolean): number => {
+      const subIdx = headers.findIndex(predicate);
+      if (subIdx >= 0) return subIdx;
+      return groupHeaders.findIndex(predicate);
+    };
+
+    const waybillIndex = findCol(h =>
+      h === 'ma_don_ghn' || h === 'ma_don' || h === 'ma_van_don' || h === 'tracking' ||
+      h === 'ma_don_hang' || h.startsWith('ma_don') || h.startsWith('ma_van_don')
+    );
+
+    const shopIndex = findCol(h =>
+      h === 'cua_hang' || h === 'ten_shop' || h === 'shop' || h === 'kho' ||
+      h.includes('cua_hang') || h.includes('ten_shop') || h.includes('ma_shop') || h.includes('ma_kho')
+    );
+
+    const statusIndex = findCol(h =>
+      h === 'trang_thai' || h.startsWith('trang_thai') || h === 'tinh_trang'
+    );
+
+    const codIndex = findCol(h =>
+      h === 'tien_cod' || h.startsWith('tien_cod') || h === 'cod' || h.startsWith('cod') ||
+      h.includes('thu_ho')
+    );
+
+    const settlementIndex = findCol(h =>
+      h === 'tong_doi_soat' || h.startsWith('tong_doi_soat') || h.includes('tong_doi_soat') ||
+      h === 'thuc_nhan' || h === 'tong_thanh_toan' || h.includes('thanh_toan')
+    );
+
+    const feeIndexes: number[] = [];
+    const maxScanCols = Math.max(headers.length, groupHeaders.length);
+    for (let c = 0; c < maxScanCols; c++) {
+      const h = headers[c] || '';
+      const gh = groupHeaders[c] || '';
+      if (
+        h === 'phi_dich_vu' || h.startsWith('phi_dich_vu') || h.includes('cuoc') || h.includes('phi_giao') ||
+        gh === 'phi_dich_vu' || gh.startsWith('phi_dich_vu') || gh.includes('cuoc') || gh.includes('phi_giao')
+      ) {
+        feeIndexes.push(c);
+      }
+    }
+
+    // Must identify waybill column and at least shop/status, and at least one financial column
+    if (waybillIndex < 0 || (shopIndex < 0 && statusIndex < 0) || (codIndex < 0 && settlementIndex < 0 && feeIndexes.length === 0)) {
+      continue;
+    }
 
     const validWaybill = (value: any) => {
       const text = String(value || '').trim();
-      return text.length >= 4 && !['ma_don_ghn', 'tong_cong', 'tong_doi_soat'].includes(normalizeHeader(text));
+      if (text.length < 4) return false;
+      // Pure serial number (1 to 4 digits like 1, 2, 1500) is a line number, never a waybill
+      if (/^\d{1,4}$/.test(text)) return false;
+      const norm = normalizeHeader(text);
+      if (['ma_don_ghn', 'ma_don', 'tong_cong', 'tong_doi_soat', 'tong_so_don', 'ngay', 'no_ton', 'thuc_nhan', 'danh_sach'].includes(norm)) {
+        return false;
+      }
+      return true;
     };
 
-    // Construct full 2-tier column names from Row 0 (Super header) + Row 1 (Sub header)
+    // Construct full 2-tier column names from Row - 1 (Super header) + Row (Sub header)
     const maxCols = Math.max(rawSuperHeaders.length, rawSubHeaders.length);
     const colNameMap: { index: number; name: string }[] = [];
     const discoveredHeadersSet = new Set<string>();
@@ -410,7 +528,7 @@ function parseGhnCodTransferSheet(rawSheetData: any[][], sheetName: string): { r
     // Find summary fee column (5) or sub-columns (5.1 to 5.6)
     const summaryFeeCol = colNameMap.find(c => {
       const n = normalizeHeader(c.name);
-      return n === 'phi_dich_vu_5' || n === 'phi_dich_vu';
+      return n === 'phi_dich_vu_5' || n === 'phi_dich_vu' || n.includes('phi_dich_vu');
     });
     const subFeeCols = colNameMap.filter(c => {
       const n = normalizeHeader(c.name);
@@ -422,7 +540,7 @@ function parseGhnCodTransferSheet(rawSheetData: any[][], sheetName: string): { r
       const row = rawSheetData[dataIndex] || [];
       const waybill = row[waybillIndex];
       if (!validWaybill(waybill)) continue;
-      const shopRaw = row[shopIndex] ?? '';
+      const shopRaw = shopIndex >= 0 ? (row[shopIndex] ?? '') : '';
       // GHN stores service fees as negative deductions. The reconciliation
       // engine represents carrier cost as a positive number and adjustment as
       // a signed offset, yielding COD - fee + adjustment = total settlement.
@@ -437,23 +555,32 @@ function parseGhnCodTransferSheet(rawSheetData: any[][], sheetName: string): { r
         fee = Math.abs(ghnNumber(row[feeIndexes[0]]));
       }
 
-      const codOnly = ghnNumber(row[codIndex]);
+      const codOnly = codIndex >= 0 ? ghnNumber(row[codIndex]) : 0;
       // GHN column (2) is 'Giao thất bại - thu tiền'. In GHN settlement, this is collected money paid out to the shop.
       const failCollection = (codIndex >= 0 && row[codIndex + 1] !== undefined) ? ghnNumber(row[codIndex + 1]) : 0;
       const cod = codOnly + failCollection;
-      const settlement = ghnNumber(row[settlementIndex]);
+      const settlement = settlementIndex >= 0 ? ghnNumber(row[settlementIndex]) : (cod - fee);
+
+      // Extract customer order code from column next to waybill if available
+      let maDonKH = '';
+      if (waybillIndex >= 0 && row[waybillIndex + 1] !== undefined) {
+        const candidate = String(row[waybillIndex + 1] || '').trim();
+        if (candidate && candidate !== String(waybill).trim() && !candidate.includes('/')) {
+          maDonKH = candidate;
+        }
+      }
 
       const rowObj: Record<string, any> = {
         'Mã đơn GHN': String(waybill).trim(),
-        'Mã đơn khách hàng': row[waybillIndex + 1] ?? '',
+        'Mã đơn khách hàng': maDonKH,
         'Cửa hàng': ghnShopNameFrom(shopRaw),
         'Tên Shop': ghnShopNameFrom(shopRaw),
         'Mã Shop/Kho': ghnShopCodeFrom(shopRaw),
-        'Người nhận': row[shopIndex + 1] ?? '',
-        'Địa chỉ nhận': row[shopIndex + 2] ?? '',
-        'Ngày tạo': row[shopIndex + 3] ?? '',
-        'Ngày giao/trả': row[shopIndex + 4] ?? '',
-        'Trạng thái': row[statusIndex] ?? '',
+        'Người nhận': shopIndex >= 0 ? (row[shopIndex + 1] ?? '') : '',
+        'Địa chỉ nhận': shopIndex >= 0 ? (row[shopIndex + 2] ?? '') : '',
+        'Ngày tạo': shopIndex >= 0 ? (row[shopIndex + 3] ?? '') : '',
+        'Ngày giao/trả': shopIndex >= 0 ? (row[shopIndex + 4] ?? '') : '',
+        'Trạng thái': statusIndex >= 0 ? (row[statusIndex] ?? '') : '',
         'Tiền COD': cod,
         'Tiền COD thuần': codOnly,
         'Giao thất bại - thu tiền': failCollection,
@@ -470,27 +597,59 @@ function parseGhnCodTransferSheet(rawSheetData: any[][], sheetName: string): { r
         const val = row[index];
         if (val !== undefined && val !== null) {
           rowObj[name] = val;
+          const normN = normalizeHeader(name);
+          if (normN.includes('ma_don_khach') || normN.includes('ma_kh') || normN === 'ma_don_kh') {
+            const vStr = String(val).trim();
+            if (vStr) rowObj['Mã đơn khách hàng'] = vStr;
+          }
         }
       });
 
       rows.push(rowObj);
     }
-    return { rows, headers: Array.from(discoveredHeadersSet) };
+    if (rows.length > 0) {
+      return { rows, headers: Array.from(discoveredHeadersSet) };
+    }
   }
   return null;
 }
 
 export function parseGhnCodTransferWorkbook(workbook: XLSX.WorkBook, sheetNames?: string[]): ParsedExcelFile | null {
   const allDiscoveredHeaders = new Set<string>();
-  const ghnSheets = workbook.SheetNames.map(sheetName => {
-    const rawSheetData: any[][] = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: '' });
+
+  // Filter sheets: skip summary / index sheets like 'Phiên' or 'Tổng quan' if multiple sheets exist
+  const candidateSheetNames = workbook.SheetNames.filter(name => {
+    if (workbook.SheetNames.length <= 1) return true;
+    const n = normalizeHeader(name);
+    if (n === 'phien' || n === 'tong_quan' || n === 'bao_cao' || n === 'summary' || n === 'index') return false;
+    const ws = workbook.Sheets[name];
+    if (!ws) return false;
+    const sample: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    const maxCols = Math.max(0, ...sample.slice(0, 15).map(r => (Array.isArray(r) ? r.length : 0)));
+    return maxCols >= 3;
+  });
+
+  // Prioritize sheets whose name starts with COD_ or contains chi_tiet
+  candidateSheetNames.sort((a, b) => {
+    const aIsCod = normalizeHeader(a).startsWith('cod_') ? 1 : 0;
+    const bIsCod = normalizeHeader(b).startsWith('cod_') ? 1 : 0;
+    return bIsCod - aIsCod;
+  });
+
+  const targetNames = candidateSheetNames.length > 0 ? candidateSheetNames : workbook.SheetNames;
+
+  const ghnSheets = targetNames.map(sheetName => {
+    const ws = workbook.Sheets[sheetName];
+    if (!ws) return null;
+    const rawSheetData: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
     const result = parseGhnCodTransferSheet(rawSheetData, sheetName);
-    if (result) {
+    if (result && result.rows.length > 0) {
       result.headers.forEach(h => allDiscoveredHeaders.add(h));
       return { name: sheetName, rows: result.rows };
     }
     return null;
   }).filter((sheet): sheet is { name: string; rows: Record<string, any>[] } => !!sheet);
+
   if (ghnSheets.length === 0) return null;
   const selectedSheets = sheetNames === undefined ? ghnSheets : ghnSheets.filter(sheet => sheetNames.includes(sheet.name));
   return {
@@ -686,8 +845,34 @@ export const ExcelService = {
           //   return;
           // }
 
-          const firstSheetName = workbook.SheetNames[0];
-          const worksheet = workbook.Sheets[firstSheetName];
+          // Intelligent Sheet Selection Fallback:
+          // Never blind-pick Sheet 0 if Sheet 0 is a 2-column index sheet like 'Phiên'!
+          let targetSheetName = workbook.SheetNames[0];
+          if (workbook.SheetNames.length > 1) {
+            // Find a sheet starting with COD_ or containing chi_tiet/don_hang/danh_sach
+            const candidate = workbook.SheetNames.find(sn => {
+              const n = normalizeHeader(sn);
+              return n.startsWith('cod_') || n.includes('chi_tiet') || n.includes('don_hang') || n.includes('danh_sach');
+            });
+            if (candidate) {
+              targetSheetName = candidate;
+            } else {
+              // Pick sheet with greatest column count (avoiding 1-2 column summary sheets)
+              let maxColsFound = 0;
+              for (const sn of workbook.SheetNames) {
+                const ws = workbook.Sheets[sn];
+                if (!ws) continue;
+                const sample: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+                const cols = Math.max(0, ...sample.slice(0, 10).map(r => (Array.isArray(r) ? r.length : 0)));
+                if (cols > maxColsFound) {
+                  maxColsFound = cols;
+                  targetSheetName = sn;
+                }
+              }
+            }
+          }
+
+          const worksheet = workbook.Sheets[targetSheetName];
           
           // Convert sheet to 2D array of rows to inspect headers
           const rawSheetData: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
@@ -728,31 +913,49 @@ export const ExcelService = {
           let hasSecondHeaderRow = false;
           if (headerRowIndex + 1 < rawSheetData.length) {
             const nextRow = rawSheetData[headerRowIndex + 1];
-            if (Array.isArray(nextRow)) {
-              const nextRowStr = nextRow.map(c => normalizeHeader(String(c))).join(' ');
-              const isNextRowHeader = (
-                nextRowStr.includes('ma_van_don') ||
-                nextRowStr.includes('tracking') ||
-                nextRowStr.includes('mvd') ||
-                nextRowStr.includes('ma_don') ||
-                nextRowStr.includes('ten_shop') ||
-                nextRowStr.includes('nguoi_gui') ||
-                nextRowStr.includes('thu_ho') ||
-                nextRowStr.includes('cod') ||
-                nextRowStr.includes('cuoc') ||
-                nextRowStr.includes('phi') ||
-                nextRowStr.includes('trong_luong') ||
-                nextRowStr.includes('can_nang') ||
-                nextRowStr.includes('sdt') ||
-                nextRowStr.includes('dien_thoai') ||
-                nextRowStr.includes('trang_thai') ||
-                nextRowStr.includes('dia_chi')
-              );
+            if (Array.isArray(nextRow) && nextRow.length > 0) {
+              // Ensure nextRow is not a real data row containing order details, phone numbers, waybill codes or numeric amounts
+              const hasRealOrderData = nextRow.some(val => {
+                if (val === null || val === undefined || val === '') return false;
+                if (typeof val === 'number' && val > 100) return true;
+                const s = String(val).trim();
+                if (!s) return false;
+                // Numeric amount > 100
+                if (/^\d{3,}$/.test(s) && Number(s) > 100 && !s.startsWith('0')) return true;
+                // Vietnamese phone number (09xx, 08xx, 07xx, 03xx, 05xx)
+                if (/^0[1-9]\d{8,9}$/.test(s.replace(/[\s.-]/g, ''))) return true;
+                // Date/time timestamp (e.g. 2026-10-19, 19/10/2026)
+                if (/^\d{4}-\d{2}-\d{2}/.test(s) || /^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(s)) return true;
+                // Waybill code (10 to 15 digits)
+                if (/^\d{10,15}$/.test(s)) return true;
+                return false;
+              });
 
-              // Ensure nextRow is not a real data row containing numeric values > 100 or dates
-              const hasRealNumericData = nextRow.some(val => typeof val === 'number' && val > 100);
-              if (isNextRowHeader && !hasRealNumericData) {
-                hasSecondHeaderRow = true;
+              if (!hasRealOrderData) {
+                const nextRowStr = nextRow.map(c => normalizeHeader(String(c))).join(' ');
+                const isNextRowHeader = (
+                  nextRowStr.includes('ma_van_don') ||
+                  nextRowStr.includes('so_van_don') ||
+                  nextRowStr.includes('tracking') ||
+                  nextRowStr.includes('mvd') ||
+                  nextRowStr.includes('ma_don') ||
+                  nextRowStr.includes('ten_shop') ||
+                  nextRowStr.includes('nguoi_gui') ||
+                  nextRowStr.includes('thu_ho') ||
+                  nextRowStr.includes('cod') ||
+                  nextRowStr.includes('cuoc') ||
+                  nextRowStr.includes('phi') ||
+                  nextRowStr.includes('trong_luong') ||
+                  nextRowStr.includes('can_nang') ||
+                  nextRowStr.includes('sdt') ||
+                  nextRowStr.includes('dien_thoai') ||
+                  nextRowStr.includes('trang_thai') ||
+                  nextRowStr.includes('dia_chi')
+                );
+
+                if (isNextRowHeader) {
+                  hasSecondHeaderRow = true;
+                }
               }
             }
           }
@@ -869,7 +1072,7 @@ export const ExcelService = {
     }
 
     const carrierId = statement.orders?.[0]?.carrierId;
-    const savedSettings = customExportSettings || (carrierId ? StorageService.getCarrierExportSettings(carrierId) : undefined);
+    const savedSettings = customExportSettings || (carrierId ? StorageService.getCarrierExportSettings(carrierId) : StorageService.getExportColumnSettings()) || StorageService.getExportColumnSettings();
     
     // Default to ALL merged columns from the 2 files if no custom carrier settings exist
     const activeCols = buildDynamicColumnsFromOrders(statement.orders, savedSettings, false);
@@ -1180,14 +1383,16 @@ export const ExcelService = {
           normId === 'codamount' || normId === 'shopfee' || normId === 'shopotherfee' || normId === 'netpayout' || normId === 'nvcfee' || normId === 'profit' ||
           normLabel.includes('cod') || normLabel.includes('thu_ho') || normLabel.includes('cuoc') || normLabel.includes('thuc_chuyen') || normLabel.includes('thuc_tra') || normLabel.includes('phi') || normLabel.includes('tien_')
         ) {
-          const num = Number(cell.value);
-          if (!isNaN(num) && typeof cell.value === 'number') {
+          const rawNum = cell.value !== null && cell.value !== undefined && cell.value !== '' ? Number(String(cell.value).replace(/,/g, '')) : NaN;
+          if (!isNaN(rawNum)) {
+            cell.value = rawNum;
             cell.numFmt = '#,##0';
             cell.alignment = { horizontal: 'right' };
           }
         } else if (normId === 'weight' || normLabel.includes('khoi_luong') || normLabel.includes('trong_luong') || normLabel.includes('can_nang')) {
-          const num = Number(cell.value);
-          if (!isNaN(num)) {
+          const rawNum = cell.value !== null && cell.value !== undefined && cell.value !== '' ? Number(String(cell.value).replace(/,/g, '')) : NaN;
+          if (!isNaN(rawNum)) {
+            cell.value = rawNum;
             cell.numFmt = '#,##0.00';
             cell.alignment = { horizontal: 'right' };
           }
@@ -1438,7 +1643,7 @@ export const ExcelService = {
     session.unmatchedOrders.forEach(o => allOrders.push(o));
 
     // Respect user's explicit master column configuration or default to ALL merged columns from 2 files
-    const savedMasterSettings = customExportSettings || (carrierId ? StorageService.getCarrierExportSettings(carrierId) : undefined);
+    const savedMasterSettings = customExportSettings || (carrierId ? StorageService.getCarrierExportSettings(carrierId) : StorageService.getExportColumnSettings()) || StorageService.getExportColumnSettings();
     const activeMasterCols = buildDynamicColumnsFromOrders(allOrders, savedMasterSettings, true);
 
     const wsDetails = workbook.addWorksheet('CHI_TIET_TOAN_BO_DON_HANG');
@@ -1530,14 +1735,16 @@ export const ExcelService = {
           normId === 'codamount' || normId === 'shopfee' || normId === 'nvcfee' || normId === 'profit' || normId === 'netpayout' ||
           normLabel.includes('cod') || normLabel.includes('thu_ho') || normLabel.includes('cuoc') || normLabel.includes('lai_rong') || normLabel.includes('loi_nhuan') || normLabel.includes('thuc_chuyen') || normLabel.includes('thuc_tra')
         ) {
-          const num = Number(cell.value);
-          if (!isNaN(num) && typeof cell.value === 'number') {
+          const rawNum = cell.value !== null && cell.value !== undefined && cell.value !== '' ? Number(String(cell.value).replace(/,/g, '')) : NaN;
+          if (!isNaN(rawNum)) {
+            cell.value = rawNum;
             cell.numFmt = '#,##0';
             cell.alignment = { horizontal: 'right' };
           }
         } else if (normId === 'weight' || normLabel.includes('khoi_luong') || normLabel.includes('trong_luong') || normLabel.includes('can_nang')) {
-          const num = Number(cell.value);
-          if (!isNaN(num)) {
+          const rawNum = cell.value !== null && cell.value !== undefined && cell.value !== '' ? Number(String(cell.value).replace(/,/g, '')) : NaN;
+          if (!isNaN(rawNum)) {
+            cell.value = rawNum;
             cell.numFmt = '#,##0.00';
             cell.alignment = { horizontal: 'right' };
           }
@@ -1922,6 +2129,337 @@ export const ExcelService = {
     const buffer = await workbook.xlsx.writeBuffer();
     const filename = `Danh_Sach_Di_Tien_Ngan_Hang_${sessionName.replace(/[^a-zA-Z0-9]/g, '_')}.xlsx`;
     const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    saveAs(blob, filename);
+    saveBlobFile(blob, filename);
+  },
+
+  /**
+   * 📤 Xuất danh sách thông tin các Shop và Bảng giá cước bậc thang chi tiết ra Excel
+   */
+  async exportShopsDirectoryExcel(shops: any[], carrierName?: string): Promise<void> {
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'GomDon Pro';
+    workbook.created = new Date();
+
+    const borderThin: Partial<ExcelJS.Borders> = {
+      top: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+      left: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+      bottom: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+      right: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+    };
+
+    // ──────────────────────────────────────────
+    // SHEET 1: DANH SÁCH THÔNG TIN SHOP
+    // ──────────────────────────────────────────
+    const wsShops = workbook.addWorksheet('Danh Sách Shop', {
+      views: [{ showGridLines: true, state: 'frozen', ySplit: 4 }]
+    });
+
+    const titleRow1 = wsShops.addRow(['DANH SÁCH HỒ SƠ & THÔNG TIN SHOP ĐỐI SOÁT']);
+    titleRow1.font = { name: 'Arial', size: 15, bold: true, color: { argb: 'FF1E293B' } };
+    wsShops.mergeCells('A1:L1');
+
+    const subTitleRow1 = wsShops.addRow([
+      `Đơn vị vận chuyển: ${carrierName || 'Tất cả'} | Tổng số shop: ${shops.length} | Ngày xuất: ${new Date().toLocaleDateString('vi-VN')}`
+    ]);
+    subTitleRow1.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF64748B' } };
+    wsShops.mergeCells('A2:L2');
+    wsShops.addRow([]);
+
+    const headers1 = wsShops.addRow([
+      'STT',
+      'Mã Shop',
+      'Tên Shop',
+      'Số Điện Thoại',
+      'Email Đối Soát',
+      'Địa Chỉ Kho',
+      'Ngân Hàng',
+      'Số Tài Khoản',
+      'Chủ Tài Khoản',
+      'ĐVVC Phụ Trách',
+      'CTV Quản Lý',
+      'Tên Nhãn Gửi Phụ'
+    ]);
+
+    headers1.height = 26;
+    headers1.eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } };
+      cell.font = { name: 'Arial', size: 10.5, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      cell.border = borderThin;
+    });
+
+    shops.forEach((shop, idx) => {
+      const phones = [shop.phone, ...(shop.phoneList || [])].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(', ');
+      const emails = [shop.email, ...(shop.emailList || [])].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(', ');
+      const aliases = (shop.nameAliases || []).filter(Boolean).join(', ');
+
+      const row = wsShops.addRow([
+        idx + 1,
+        shop.code || '',
+        shop.name || '',
+        phones || 'Chưa có',
+        emails || 'Chưa có',
+        shop.address || 'Chưa có',
+        shop.bankAccount?.bankName || 'Chưa có',
+        shop.bankAccount?.accountNumber ? String(shop.bankAccount.accountNumber) : 'Chưa có',
+        shop.bankAccount?.accountHolder || '',
+        (shop.carrierId || '').toUpperCase() || 'MẶC ĐỊNH',
+        shop.ctvName || (shop.ctvId ? `CTV #${shop.ctvId}` : 'Chưa phân công'),
+        aliases || ''
+      ]);
+
+      row.height = 22;
+      row.eachCell((cell, colNumber) => {
+        cell.border = borderThin;
+        cell.font = { name: 'Arial', size: 10 };
+        if (colNumber === 1 || colNumber === 2 || colNumber === 10) {
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        } else if (colNumber === 4 || colNumber === 8) {
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        } else {
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+        }
+      });
+      if (idx % 2 === 1) {
+        row.eachCell(cell => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
+        });
+      }
+    });
+
+    wsShops.columns = [
+      { width: 7 },
+      { width: 14 },
+      { width: 28 },
+      { width: 18 },
+      { width: 24 },
+      { width: 28 },
+      { width: 16 },
+      { width: 18 },
+      { width: 22 },
+      { width: 16 },
+      { width: 18 },
+      { width: 24 },
+    ];
+
+    // ──────────────────────────────────────────
+    // SHEET 2: BẢNG GIÁ CHI TIẾT CÁC SHOP (TỔNG HỢP)
+    // ──────────────────────────────────────────
+    const wsPricing = workbook.addWorksheet('Bảng Giá Chi Tiết', {
+      views: [{ showGridLines: true, state: 'frozen', ySplit: 4 }]
+    });
+
+    const titleRow2 = wsPricing.addRow(['BẢNG GIÁ CƯỚC BẬC THANG & PHỤ PHÍ CHI TIẾT CỦA CÁC SHOP']);
+    titleRow2.font = { name: 'Arial', size: 15, bold: true, color: { argb: 'FF1E293B' } };
+    wsPricing.mergeCells('A1:J1');
+
+    const subTitleRow2 = wsPricing.addRow([
+      `Đơn vị vận chuyển: ${carrierName || 'Tất cả'} | Tổng số shop: ${shops.length} | Ngày xuất: ${new Date().toLocaleDateString('vi-VN')}`
+    ]);
+    subTitleRow2.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF64748B' } };
+    wsPricing.mergeCells('A2:J2');
+    wsPricing.addRow([]);
+
+    const headers2 = wsPricing.addRow([
+      'STT',
+      'Mã Shop',
+      'Tên Shop',
+      'Tên Biểu Giá',
+      'Bậc Thang Cân Nặng (Chi Tiết Mức Giá)',
+      'Vượt Cân (Mỗi nấc)',
+      'Giá Vượt Cân (VNĐ)',
+      'Quy Định Cước Hoàn',
+      'Phí Bảo Hiểm / Khai Giá',
+      'Phụ Phí Cố Định'
+    ]);
+
+    headers2.height = 26;
+    headers2.eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F766E' } };
+      cell.font = { name: 'Arial', size: 10.5, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      cell.border = borderThin;
+    });
+
+    shops.forEach((shop, idx) => {
+      const plan = shop.pricingPlan || {};
+      const rules = plan.weightRules || [];
+      
+      const rulesStr = rules.length > 0
+        ? rules.map((r: any, rIdx: number) => {
+            const min = rIdx === 0 ? 0 : r.minWeight;
+            const priceFormatted = new Intl.NumberFormat('vi-VN').format(r.price || 0);
+            return `• ${min}-${r.maxWeight}kg: ${priceFormatted} đ`;
+          }).join('\n')
+        : 'Chưa cài đặt';
+
+      let returnFeeStr = 'Miễn phí hoàn (0 đ)';
+      if (plan.returnFeeType === 'fixed' || (plan.returnFeeFixed && plan.returnFeeFixed > 0 && plan.returnFeeType !== 'percent')) {
+        returnFeeStr = `Cố định: ${new Intl.NumberFormat('vi-VN').format(plan.returnFeeFixed || 0)} đ/đơn`;
+      } else if (plan.returnFeeType === 'percent' || (plan.returnFeePercent && plan.returnFeePercent > 0)) {
+        returnFeeStr = `${plan.returnFeePercent}% cước gửi`;
+      } else if (plan.returnFeeType === 'free') {
+        returnFeeStr = 'Miễn phí hoàn (0 đ)';
+      }
+
+      const insuranceStr = (plan.insuranceFeePercent || plan.declaredFeePercent)
+        ? `${plan.insuranceFeePercent || plan.declaredFeePercent}%`
+        : '0%';
+
+      const surchargeStr = plan.fixedSurcharge
+        ? `${new Intl.NumberFormat('vi-VN').format(plan.fixedSurcharge)} đ`
+        : '0 đ';
+
+      const row = wsPricing.addRow([
+        idx + 1,
+        shop.code || '',
+        shop.name || '',
+        plan.name || 'Bảng giá tùy chỉnh',
+        rulesStr,
+        `+${plan.extraStepWeight || 0.5} kg`,
+        plan.extraStepPrice || 0,
+        returnFeeStr,
+        insuranceStr,
+        surchargeStr
+      ]);
+
+      row.height = Math.max(24, Math.max(1, rules.length) * 16);
+      row.eachCell((cell, colNumber) => {
+        cell.border = borderThin;
+        cell.font = { name: 'Arial', size: 10 };
+        if (colNumber === 1 || colNumber === 2) {
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        } else if (colNumber === 5) {
+          cell.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
+        } else if (colNumber === 6 || colNumber === 8 || colNumber === 9 || colNumber === 10) {
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        } else if (colNumber === 7) {
+          cell.alignment = { vertical: 'middle', horizontal: 'right' };
+          cell.numFmt = '#,##0';
+        } else {
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+        }
+      });
+
+      if (idx % 2 === 1) {
+        row.eachCell(cell => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0FDF4' } };
+        });
+      }
+    });
+
+    wsPricing.columns = [
+      { width: 7 },
+      { width: 14 },
+      { width: 28 },
+      { width: 24 },
+      { width: 34 },
+      { width: 16 },
+      { width: 18 },
+      { width: 22 },
+      { width: 18 },
+      { width: 16 },
+    ];
+
+    // ──────────────────────────────────────────
+    // SHEET 3: MA TRẬN BẬC THANG CÂN NẶNG (DỄ ĐỐI CHIẾU DẠNG CỘT)
+    // ──────────────────────────────────────────
+    const wsMatrix = workbook.addWorksheet('Ma Trận Bậc Cân', {
+      views: [{ showGridLines: true, state: 'frozen', ySplit: 4 }]
+    });
+
+    const titleRow3 = wsMatrix.addRow(['MA TRẬN BIỂU PHÍ BẬC THANG CÂN NẶNG TỪNG SHOP']);
+    titleRow3.font = { name: 'Arial', size: 15, bold: true, color: { argb: 'FF1E293B' } };
+    wsMatrix.mergeCells('A1:I1');
+
+    const subTitleRow3 = wsMatrix.addRow([
+      `Đơn vị vận chuyển: ${carrierName || 'Tất cả'} | Tổng số shop: ${shops.length} | Ngày xuất: ${new Date().toLocaleDateString('vi-VN')}`
+    ]);
+    subTitleRow3.font = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF64748B' } };
+    wsMatrix.mergeCells('A2:I2');
+    wsMatrix.addRow([]);
+
+    const headers3 = wsMatrix.addRow([
+      'STT',
+      'Mã Shop',
+      'Tên Shop',
+      'Mức 1 (≤ Max 1)',
+      'Mức 2 (≤ Max 2)',
+      'Mức 3 (≤ Max 3)',
+      'Mức 4 (≤ Max 4)',
+      'Vượt Cân (Mỗi +kg)',
+      'Phí Vượt Cân (VNĐ)'
+    ]);
+
+    headers3.height = 26;
+    headers3.eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4338CA' } };
+      cell.font = { name: 'Arial', size: 10.5, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      cell.border = borderThin;
+    });
+
+    shops.forEach((shop, idx) => {
+      const plan = shop.pricingPlan || {};
+      const rules = plan.weightRules || [];
+
+      const getTierText = (ruleIdx: number) => {
+        const r = rules[ruleIdx];
+        if (!r) return '-';
+        const priceFmt = new Intl.NumberFormat('vi-VN').format(r.price || 0);
+        return `≤ ${r.maxWeight}kg: ${priceFmt} đ`;
+      };
+
+      const row = wsMatrix.addRow([
+        idx + 1,
+        shop.code || '',
+        shop.name || '',
+        getTierText(0),
+        getTierText(1),
+        getTierText(2),
+        getTierText(3),
+        `+${plan.extraStepWeight || 0.5} kg`,
+        plan.extraStepPrice || 0
+      ]);
+
+      row.height = 22;
+      row.eachCell((cell, colNumber) => {
+        cell.border = borderThin;
+        cell.font = { name: 'Arial', size: 10 };
+        if (colNumber === 1 || colNumber === 2 || colNumber >= 4) {
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        } else {
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+        }
+        if (colNumber === 9) {
+          cell.alignment = { vertical: 'middle', horizontal: 'right' };
+          cell.numFmt = '#,##0';
+        }
+      });
+
+      if (idx % 2 === 1) {
+        row.eachCell(cell => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF5F3FF' } };
+        });
+      }
+    });
+
+    wsMatrix.columns = [
+      { width: 7 },
+      { width: 14 },
+      { width: 28 },
+      { width: 22 },
+      { width: 22 },
+      { width: 22 },
+      { width: 22 },
+      { width: 18 },
+      { width: 18 },
+    ];
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    const carrierTag = carrierName ? carrierName.replace(/[^a-zA-Z0-9]/g, '_') : 'Tat_Ca';
+    const filename = `Bang_Gia_Va_Thong_Tin_Shop_${carrierTag}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    saveBlobFile(blob, filename);
   },
 };

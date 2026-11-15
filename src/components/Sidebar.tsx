@@ -8,7 +8,9 @@ import {
   Award,
   Send,
   Settings,
-  UserCheck
+  UserCheck,
+  Banknote,
+  PackageSearch
 } from 'lucide-react';
 import type { UserAccount } from '../types';
 
@@ -39,6 +41,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
           desc: 'Ghép 2 file & tính tiền COD',
           icon: FileSpreadsheet,
           badge: 'Chính',
+          roles: ['ADMIN', 'ACCOUNTANT', 'STAFF', 'VIEWER']
+        },
+        { 
+          id: 'daily_advances', 
+          label: 'Ứng COD Hàng Ngày', 
+          desc: 'Quyết toán ứng T+0 & cuốn chiếu',
+          icon: Banknote,
+          badge: 'T+0',
+          roles: ['ADMIN', 'ACCOUNTANT']
+        },
+        { 
+          id: 'loss_tracking', 
+          label: 'Quản Lý Đơn Hàng', 
+          desc: 'Toàn trình, rủi ro & xử lý bồi thường',
+          icon: PackageSearch,
+          badge: 'Cảnh Báo',
           roles: ['ADMIN', 'ACCOUNTANT', 'STAFF', 'VIEWER']
         },
         { 
