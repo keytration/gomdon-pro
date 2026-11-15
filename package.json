@@ -9,6 +9,7 @@
     "start": "node server.js",
     "lint": "oxlint",
     "package": "node scripts/build-package.mjs",
+    "create-key": "node scripts/create-key.js",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SCRIPT CÀI ĐẶT TỰ ĐỘNG GOM ĐƠN PRO ENTERPRISE CHO UBUNTU 22.04 LTS
+# SCRIPT CÀI ĐẶT TỰ ĐỘNG GOM ĐƠN PRO ENTERPRISE CHO UBUNTU 20.04 / 22.04 LTS
 # ==============================================================================
 
 set -e
@@ -17,18 +17,16 @@ NC='\033[0m'
 # Cấu hình mặc định
 APP_NAME="GomDon Pro Enterprise"
 APP_ID="ductinlogistics"
-INSTALL_DIR="/opt/gomdon-pro"
+CURRENT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${CURRENT_SCRIPT_DIR}"
 SERVICE_NAME="gomdon"
 APP_PORT=3000
-
-# Link tải file binary độc lập (Admin thay link này bằng link CDN/GitHub/Server riêng)
-BINARY_DOWNLOAD_URL="https://licensehub.shop/downloads/gomdon-server"
 
 clear
 echo -e "${CYAN}${BOLD}"
 echo "================================================================================"
 echo "    🚀 CHƯƠNG TRÌNH CÀI ĐẶT TỰ ĐỘNG - GOM ĐƠN PRO ENTERPRISE SERVER"
-echo "    Bảo vệ bản quyền LicenseHub & Đóng gói Standalone Binary (Ubuntu 22.04)"
+echo "    Bảo vệ bản quyền Offline RSA 2048-bit & Tối ưu hoá vận hành trên Ubuntu"
 echo "================================================================================"
 echo -e "${NC}"
 
@@ -39,14 +37,28 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# Hiển thị Hardware ID (HWID) máy chủ
+SERVER_HWID=""
+if [ -f "/etc/machine-id" ]; then
+  SERVER_HWID=$(sha256sum /etc/machine-id | awk '{print toupper(substr($1,1,32))}')
+elif [ -f "/var/lib/dbus/machine-id" ]; then
+  SERVER_HWID=$(sha256sum /var/lib/dbus/machine-id | awk '{print toupper(substr($1,1,32))}')
+fi
+
 # 2. Thu thập thông tin từ khách hàng
 echo -e "${YELLOW}${BOLD}📌 BƯỚC 1: THIẾT LẬP THÔNG TIN TRIỂN KHAI${NC}"
 echo "--------------------------------------------------------------------------------"
 
+if [ -n "$SERVER_HWID" ]; then
+  echo -e "🖥️  ${BOLD}MÃ ĐỊNH DANH MÁY CHỦ (HWID):${NC} ${BOLD}${CYAN}${SERVER_HWID}${NC}"
+  echo -e "👉 Cung cấp mã HWID này cho Admin nếu bạn đăng ký bản quyền khóa theo máy chủ."
+  echo ""
+fi
+
 # Nhập License Key
 LICENSE_KEY=""
 while [ -z "$LICENSE_KEY" ]; do
-  read -p "$(echo -e "${CYAN}👉 Nhập License Key được cấp từ LicenseHub:${NC} ")" LICENSE_KEY
+  read -p "$(echo -e "${CYAN}👉 Nhập License Key của bạn (bắt đầu bằng GMD1-...):${NC} ")" LICENSE_KEY
   LICENSE_KEY=$(echo "$LICENSE_KEY" | tr -d '[:space:]')
   if [ -z "$LICENSE_KEY" ]; then
     echo -e "${RED}⚠️ License Key không được để trống! Vui lòng nhập lại.${NC}"
@@ -65,7 +77,7 @@ done
 
 echo ""
 echo -e "${GREEN}✅ Đã ghi nhận thông tin:${NC}"
-echo -e "   - License Key: ${BOLD}${LICENSE_KEY}${NC}"
+echo -e "   - License Key: ${BOLD}${LICENSE_KEY:0:15}...${LICENSE_KEY: -10}${NC}"
 echo -e "   - Domain:      ${BOLD}https://${DOMAIN}${NC}"
 echo -e "   - App ID:      ${BOLD}${APP_ID}${NC}"
 echo ""
@@ -92,13 +104,22 @@ else
 fi
 
 echo ""
-echo -e "${YELLOW}${BOLD}📌 BƯỚC 2: CHUẨN BỊ MÔI TRƯỜNG & TẢI FILE THỰC THI NHỊ PHÂN${NC}"
+echo -e "${YELLOW}${BOLD}📌 BƯỚC 2: CÀI ĐẶT MÔI TRƯỜNG & GÓI PHỤ THUỘC${NC}"
 echo "--------------------------------------------------------------------------------"
 
-# Cài đặt các gói phụ trợ
+# Cài đặt Nginx, Certbot, UFW, DNSUtils
 echo -e "${CYAN}📦 Cập nhật hệ thống và cài đặt Nginx, Certbot...${NC}"
 apt-get update -y -q
 apt-get install -y -q curl wget nginx certbot python3-certbot-nginx ufw dnsutils
+
+# Cài đặt Node.js 20 LTS nếu chưa có hoặc phiên bản cũ
+if ! command -v node >/dev/null 2>&1 || [ "$(node -v | cut -d'.' -f1 | tr -d 'v')" -lt 18 ]; then
+  echo -e "${CYAN}📦 Đang cài đặt Node.js 20 LTS...${NC}"
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y -q nodejs
+fi
+NODE_PATH=$(which node)
+echo -e "${GREEN}✅ Node.js: $(node -v) (${NODE_PATH})${NC}"
 
 # Mở Firewall nếu UFW đang bật
 if ufw status | grep -q "Status: active"; then
@@ -108,30 +129,14 @@ if ufw status | grep -q "Status: active"; then
   ufw allow 22/tcp >/dev/null 2>&1
 fi
 
-# Tạo thư mục cài đặt
-echo -e "${CYAN}📁 Tạo thư mục hệ thống tại ${INSTALL_DIR}...${NC}"
+# Cài đặt dependencies và build giao diện
+echo -e "${CYAN}📦 Đang cài đặt thư viện npm và build giao diện...${NC}"
+cd "${INSTALL_DIR}"
+npm install
+npm run build
+
+# Tạo thư mục dữ liệu data/
 mkdir -p "${INSTALL_DIR}/data"
-
-# Kiểm tra nếu file binary có sẵn trong thư mục hiện tại (khi admin giải nén cài offline)
-CURRENT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "${CURRENT_SCRIPT_DIR}/gomdon-server" ]; then
-  echo -e "${GREEN}✅ Tìm thấy file binary sẵn có tại thư mục cài đặt. Đang sao chép vào ${INSTALL_DIR}...${NC}"
-  cp -f "${CURRENT_SCRIPT_DIR}/gomdon-server" "${INSTALL_DIR}/gomdon-server"
-elif [ -f "${CURRENT_SCRIPT_DIR}/dist-bin/gomdon-server" ]; then
-  echo -e "${GREEN}✅ Tìm thấy file binary tại dist-bin. Đang sao chép vào ${INSTALL_DIR}...${NC}"
-  cp -f "${CURRENT_SCRIPT_DIR}/dist-bin/gomdon-server" "${INSTALL_DIR}/gomdon-server"
-else
-  echo -e "${CYAN}🌐 Đang tải Standalone Binary từ kho lưu trữ bảo mật...${NC}"
-  if wget -q --show-progress "${BINARY_DOWNLOAD_URL}" -O "${INSTALL_DIR}/gomdon-server"; then
-    echo -e "${GREEN}✅ Tải file thực thi thành công!${NC}"
-  else
-    echo -e "${RED}❌ Không thể tải file binary từ ${BINARY_DOWNLOAD_URL}${NC}"
-    echo -e "👉 Vui lòng đặt file thực thi 'gomdon-server' vào ${INSTALL_DIR}/ hoặc chạy script trong cùng thư mục với file binary."
-    exit 1
-  fi
-fi
-
-chmod +x "${INSTALL_DIR}/gomdon-server"
 
 # Tạo file cấu hình license
 cat <<EOF > "${INSTALL_DIR}/data/license.json"
@@ -142,19 +147,18 @@ cat <<EOF > "${INSTALL_DIR}/data/license.json"
 EOF
 
 echo ""
-echo -e "${YELLOW}${BOLD}📌 BƯỚC 3: XÁC THỰC & KÍCH HOẠT BẢN QUYỀN LICENSEHUB${NC}"
+echo -e "${YELLOW}${BOLD}📌 BƯỚC 3: XÁC THỰC BẢN QUYỀN HỆ THỐNG${NC}"
 echo "--------------------------------------------------------------------------------"
-echo -e "${CYAN}⚡ Đang kết nối tới https://licensehub.shop để kích hoạt bản quyền...${NC}"
+echo -e "${CYAN}⚡ Đang xác thực chữ ký bản quyền...${NC}"
 
 # Chạy lệnh kích hoạt với cờ --activate
-if "${INSTALL_DIR}/gomdon-server" --activate --key="${LICENSE_KEY}" --app-id="${APP_ID}"; then
+if "${NODE_PATH}" "${INSTALL_DIR}/server.js" --activate --key="${LICENSE_KEY}" --app-id="${APP_ID}"; then
   echo -e "${GREEN}✅ KÍCH HOẠT BẢN QUYỀN THÀNH CÔNG!${NC}"
 else
   echo ""
   echo -e "${RED}❌ [CẢNH BÁO BẢN QUYỀN]: KÍCH HOẠT THẤT BẠI!${NC}"
-  echo -e "${RED}👉 Mã License Key không hợp lệ, đã hết hạn hoặc không khớp với mã máy chủ này.${NC}"
-  echo -e "👉 Vui lòng kiểm tra lại trên https://licensehub.shop hoặc liên hệ quản trị viên."
-  # Dọn dẹp file cấu hình lỗi
+  echo -e "${RED}👉 Mã License Key không hợp lệ, đã hết hạn hoặc không khớp với máy chủ này.${NC}"
+  echo -e "👉 Vui lòng liên hệ quản trị viên để nhận mã License Key mới."
   rm -f "${INSTALL_DIR}/data/license.json"
   exit 1
 fi
@@ -172,7 +176,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/gomdon-server
+ExecStart=${NODE_PATH} ${INSTALL_DIR}/server.js
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -191,7 +195,6 @@ systemctl restart ${SERVICE_NAME}.service
 
 echo -e "${GREEN}✅ Dịch vụ Systemd '${SERVICE_NAME}' đã được khởi tạo và kích hoạt tự bật khi khởi động VPS!${NC}"
 
-# Đợi 2 giây kiểm tra trạng thái service
 sleep 2
 if systemctl is-active --quiet ${SERVICE_NAME}.service; then
   echo -e "${GREEN}✅ Tiến trình ứng dụng đang chạy ổn định (PID: $(systemctl show --property MainPID --value ${SERVICE_NAME})).${NC}"
@@ -213,7 +216,6 @@ server {
 
     client_max_body_size 100M;
 
-    # Kích hoạt nén Gzip (R3)
     gzip on;
     gzip_vary on;
     gzip_proxied any;
@@ -231,7 +233,6 @@ server {
         application/xml+rss
         image/svg+xml;
 
-    # Cấu hình Cache-Control cho static assets trong /assets/ (R3)
     location /assets/ {
         proxy_pass http://127.0.0.1:${APP_PORT};
         proxy_http_version 1.1;
@@ -258,46 +259,33 @@ server {
 EOF
 
 ln -sf /etc/nginx/sites-available/${DOMAIN}.conf /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
 
 # Kiểm tra cú pháp Nginx
 if nginx -t >/dev/null 2>&1; then
   systemctl reload nginx
-  echo -e "${GREEN}✅ Cấu hình Reverse Proxy Nginx thành công.${NC}"
+  echo -e "${GREEN}✅ Nginx Reverse Proxy đã cấu hình thành công!${NC}"
 else
-  echo -e "${RED}❌ Lỗi cú pháp cấu hình Nginx!${NC}"
-  nginx -t
+  echo -e "${RED}❌ Lỗi cấu hình Nginx. Vui lòng kiểm tra lại.${NC}"
   exit 1
 fi
 
-# Cấp chứng chỉ SSL miễn phí Let's Encrypt
-echo -e "${CYAN}🔒 Đang tự động cấp chứng chỉ bảo mật SSL HTTPS (Let's Encrypt)...${NC}"
-if certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email --redirect >/dev/null 2>&1; then
-  echo -e "${GREEN}✅ Cấp chứng chỉ SSL HTTPS thành công! Tên miền đã có ổ khóa xanh.${NC}"
-  FINAL_URL="https://${DOMAIN}"
+# Cấp chứng chỉ SSL HTTPS qua Certbot
+echo ""
+echo -e "${CYAN}🔒 Đang yêu cầu cấp chứng chỉ bảo mật SSL HTTPS từ Let's Encrypt...${NC}"
+if certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then
+  echo -e "${GREEN}✅ ĐÃ CẤP CHỨNG CHỈ SSL HTTPS THÀNH CÔNG!${NC}"
 else
-  echo -e "${YELLOW}⚠️ Chưa thể cấp chứng chỉ SSL tự động (có thể do DNS tên miền chưa cập nhật hoàn tất).${NC}"
-  echo -e "👉 Ứng dụng hiện tại có thể truy cập qua: ${CYAN}http://${DOMAIN}${NC}"
-  echo -e "👉 Sau khi DNS đã cập nhật, bạn chỉ cần chạy lệnh sau để bật HTTPS:"
-  echo -e "   ${BOLD}certbot --nginx -d ${DOMAIN}${NC}"
-  FINAL_URL="http://${DOMAIN}"
+  echo -e "${YELLOW}⚠️ Cấp chứng chỉ SSL tự động chưa thành công (Do DNS chưa cập nhật kịp hoặc chưa trỏ về VPS).${NC}"
+  echo -e "👉 Ứng dụng vẫn có thể truy cập qua HTTP: ${BOLD}http://${DOMAIN}${NC}"
+  echo -e "👉 Sau khi DNS đã trỏ xong, bạn chỉ cần gõ lệnh: ${CYAN}sudo certbot --nginx -d ${DOMAIN}${NC}"
 fi
 
 echo ""
 echo -e "${GREEN}${BOLD}================================================================================${NC}"
-echo -e "${GREEN}${BOLD}🎉 CHÚC MỪNG! HỆ THỐNG ĐÃ ĐƯỢC CÀI ĐẶT VÀ KHỞI CHẠY HOÀN TẤT TỪ A ĐẾN Z!${NC}"
+echo -e "${GREEN}${BOLD}       🎉 CHÚC MỪNG BẠN ĐÃ CÀI ĐẶT THÀNH CÔNG GOM ĐƠN PRO ENTERPRISE!${NC}"
 echo -e "${GREEN}${BOLD}================================================================================${NC}"
-echo ""
-echo -e "🌐 ${BOLD}ĐƯỜNG DẪN TRUY CẬP ỨNG DỤNG:${NC} ${CYAN}${BOLD}${FINAL_URL}${NC}"
-echo -e "🔑 ${BOLD}Trạng thái bản quyền:${NC}        ${GREEN}ĐÃ KÍCH HOẠT HỢP LỆ (LicenseHub)${NC}"
-echo -e "🖥️ ${BOLD}Mã máy chủ (HWID):${NC}           ${YELLOW}$("${INSTALL_DIR}/gomdon-server" --hwid)${NC}"
-echo -e "📁 ${BOLD}Thư mục dữ liệu:${NC}             ${INSTALL_DIR}/data"
-echo -e "⚙️ ${BOLD}Tên dịch vụ Systemd:${NC}         ${SERVICE_NAME}"
-echo ""
-echo -e "${BOLD}Các câu lệnh hữu ích khi quản trị VPS:${NC}"
-echo -e "  • Xem log hoạt động trực tiếp: ${YELLOW}journalctl -u ${SERVICE_NAME} -f${NC}"
-echo -e "  • Khởi động lại ứng dụng:      ${YELLOW}systemctl restart ${SERVICE_NAME}${NC}"
-echo -e "  • Kiểm tra trạng thái dịch vụ: ${YELLOW}systemctl status ${SERVICE_NAME}${NC}"
-echo -e "  • Dừng ứng dụng:               ${YELLOW}systemctl stop ${SERVICE_NAME}${NC}"
-echo ""
-echo -e "${CYAN}Cảm ơn bạn đã tin tưởng sử dụng giải pháp phần mềm! Mở trình duyệt để bắt đầu ngay.${NC}\n"
+echo -e "🌐 Đường dẫn truy cập:   ${BOLD}${CYAN}https://${DOMAIN}${NC}"
+echo -e "📂 Thư mục cài đặt:      ${BOLD}${INSTALL_DIR}${NC}"
+echo -e "⚙️  Dịch vụ Systemd:      ${BOLD}systemctl status ${SERVICE_NAME}${NC}"
+echo -e "📜 Xem nhật ký ứng dụng: ${BOLD}journalctl -u ${SERVICE_NAME} -f${NC}"
+echo -e "${GREEN}================================================================================${NC}\n"

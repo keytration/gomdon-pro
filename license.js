@@ -6,6 +6,17 @@ import crypto from 'crypto';
 const LICENSEHUB_API = process.env.LICENSEHUB_API_URL || 'https://licensehub.shop/api/v1/license';
 const DEFAULT_APP_ID = process.env.LICENSEHUB_APP_ID || 'ductinlogistics';
 
+// Khóa công khai RSA 2048-bit dùng để xác thực chữ ký bản quyền Offline
+const RSA_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyHk66ziqvVbeKcuTCisE
+vLkc+X5IEBsrO6AcQwWX84q0FeRJjzyRCcIAcEOxLxKItTpIF4Sbl2SAAL7Bi0i9
+LbhWNhgF142YeOn4sM31G38yxbg1kuYrv8mI4ZBq7wdDqHbb7PaKv+GlpkaTz7s8
+nXZ74aPUabJFZXMfJsaPgLGLl0u59aFR0VLWsF1u4kXjUHMheHLd4MuJiRPIu4Av
+IVSQD16YcbqEhV/iNZUoKY+hoEPsIKp3TPy14ltCYdfUaTFi3uNiwxEPeR4zzz0p
+POJ/gro6zZpXRtyJ9KIlqJxsh9bey/+qOsEaTa/TVzFUIu+8nSioTXiKQkG4MQQ0
+bQIDAQAB
+-----END PUBLIC KEY-----`;
+
 /**
  * 1. Khởi tạo Hardware Fingerprint (HWID duy nhất của máy chủ)
  * Ưu tiên đọc /etc/machine-id trên Linux Ubuntu.
@@ -43,7 +54,7 @@ export function getHardwareId() {
     rawId = `${os.hostname()}-${os.platform()}-${os.arch()}-${cpus}-${macs}`;
   }
 
-  // Chuẩn hóa SHA-256 32 ký tự HEX in hoa (Chuẩn định dạng LicenseHub)
+  // Chuẩn hóa SHA-256 32 ký tự HEX in hoa (Chuẩn định dạng License)
   return crypto.createHash('sha256').update(rawId).digest('hex').substring(0, 32).toUpperCase();
 }
 
@@ -54,11 +65,9 @@ export function getLicenseFilePath(dataDir) {
   if (process.env.LICENSE_FILE_PATH) {
     return process.env.LICENSE_FILE_PATH;
   }
-  // Nếu có dataDir thì lưu trong dataDir
   if (dataDir && fs.existsSync(dataDir)) {
     return path.join(dataDir, 'license.json');
   }
-  // Hoặc lưu cạnh file thực thi
   const isPackaged = Boolean(process.pkg);
   const appRoot = isPackaged ? path.dirname(process.execPath) : process.cwd();
   return path.join(appRoot, 'license.json');
@@ -97,14 +106,100 @@ export function saveLicenseConfig(licenseFile, data) {
 }
 
 /**
- * 2. Kích hoạt bản quyền qua API LicenseHub
- * POST https://licensehub.shop/api/v1/license/activate
+ * 2. Xác thực bản quyền Offline bằng chữ ký điện tử RSA 2048-bit
+ */
+export function verifyOfflineLicense(licenseKey, currentHwid) {
+  if (!licenseKey || !licenseKey.startsWith('GMD1-')) {
+    return null; // Không phải định dạng khóa offline GMD1
+  }
+
+  try {
+    const raw = licenseKey.substring(5); // Cắt bỏ 'GMD1-'
+    const dotIdx = raw.lastIndexOf('.');
+    if (dotIdx === -1) {
+      return { valid: false, status: 'MALFORMED', message: 'Mã bản quyền không đúng định dạng!' };
+    }
+
+    const payloadBase64 = raw.substring(0, dotIdx);
+    const signature = raw.substring(dotIdx + 1);
+
+    const payloadJson = Buffer.from(payloadBase64, 'base64url').toString('utf8');
+    const payload = JSON.parse(payloadJson);
+
+    // Xác thực chữ ký số RSA
+    const verifier = crypto.createVerify('RSA-SHA256');
+    verifier.update(payloadJson);
+    verifier.end();
+
+    const isValid = verifier.verify(RSA_PUBLIC_KEY, signature, 'base64url');
+    if (!isValid) {
+      return { valid: false, status: 'INVALID_SIGNATURE', message: 'Chữ ký bản quyền không hợp lệ hoặc đã bị can thiệp!' };
+    }
+
+    // Kiểm tra thời hạn bản quyền
+    if (payload.expires_at && new Date(payload.expires_at) < new Date()) {
+      return {
+        valid: false,
+        status: 'EXPIRED',
+        message: `Mã bản quyền đã hết hạn vào ngày ${new Date(payload.expires_at).toLocaleDateString('vi-VN')}!`
+      };
+    }
+
+    // Kiểm tra ràng buộc mã máy chủ HWID
+    const targetHwid = String(payload.hwid || 'ANY').trim().toUpperCase();
+    const myHwid = String(currentHwid || '').trim().toUpperCase();
+
+    if (targetHwid !== 'ANY' && targetHwid !== myHwid) {
+      return {
+        valid: false,
+        status: 'DEVICE_MISMATCH',
+        message: `Mã bản quyền này được cấp cho máy chủ khác (${targetHwid}), không khớp máy chủ hiện tại (${myHwid})!`
+      };
+    }
+
+    return {
+      valid: true,
+      status: 'VALID',
+      customer_name: payload.customer || 'Khách hàng',
+      expires_at: payload.expires_at,
+      app_id: payload.app_id || DEFAULT_APP_ID,
+      raw: payload
+    };
+  } catch (err) {
+    return { valid: false, status: 'ERROR', message: `Lỗi giải mã bản quyền: ${err.message}` };
+  }
+}
+
+/**
+ * 3. Kích hoạt bản quyền qua API (Hỗ trợ cả Offline RSA lẫn Online LicenseHub)
  */
 export async function activateLicense({ appId, licenseKey, hwid, deviceName = 'Ubuntu Server' }) {
+  const offlineCheck = verifyOfflineLicense(licenseKey, hwid);
+  if (offlineCheck) {
+    if (offlineCheck.valid) {
+      return {
+        success: true,
+        status: 'SUCCESS',
+        message: 'Kích hoạt bản quyền Offline RSA thành công!',
+        customer_name: offlineCheck.customer_name,
+        expires_at: offlineCheck.expires_at,
+        app_id: offlineCheck.app_id,
+        raw: offlineCheck.raw
+      };
+    } else {
+      return {
+        success: false,
+        status: offlineCheck.status,
+        message: offlineCheck.message
+      };
+    }
+  }
+
+  // Fallback Online LicenseHub
   const url = `${LICENSEHUB_API}/activate`;
   const payload = {
     app_id: appId || DEFAULT_APP_ID,
-    license_key: licenseKey.trim().toUpperCase(),
+    license_key: licenseKey.trim(),
     device_id: hwid,
     hwid: hwid,
     device_name: deviceName || 'Ubuntu Server'
@@ -141,20 +236,25 @@ export async function activateLicense({ appId, licenseKey, hwid, deviceName = 'U
     return {
       success: false,
       status: 'NETWORK_ERROR',
-      message: `Không thể kết nối đến máy chủ LicenseHub: ${err.message}`
+      message: `Không thể kết nối đến máy chủ xác thực: ${err.message}`
     };
   }
 }
 
 /**
- * 3. Xác thực bản quyền định kỳ / khi khởi động
- * POST https://licensehub.shop/api/v1/license/verify
+ * 4. Xác thực bản quyền định kỳ / khi khởi động
  */
 export async function verifyLicense({ appId, licenseKey, hwid }) {
+  const offlineCheck = verifyOfflineLicense(licenseKey, hwid);
+  if (offlineCheck) {
+    return offlineCheck;
+  }
+
+  // Fallback Online LicenseHub
   const url = `${LICENSEHUB_API}/verify`;
   const payload = {
     app_id: appId || DEFAULT_APP_ID,
-    license_key: licenseKey.trim().toUpperCase(),
+    license_key: licenseKey.trim(),
     hwid: hwid,
     device_id: hwid
   };
@@ -171,7 +271,6 @@ export async function verifyLicense({ appId, licenseKey, hwid }) {
 
     const data = await res.json().catch(() => ({}));
 
-    // Kiểm tra hết hạn trên client nếu server trả về expires_at
     if (data.expires_at && new Date(data.expires_at) < new Date()) {
       return {
         valid: false,
@@ -200,7 +299,7 @@ export async function verifyLicense({ appId, licenseKey, hwid }) {
     return {
       valid: false,
       status: 'NETWORK_ERROR',
-      message: `Không thể kết nối đến máy chủ xác thực LicenseHub: ${err.message}`
+      message: `Không thể kết nối đến máy chủ xác thực: ${err.message}`
     };
   }
 }
@@ -212,16 +311,11 @@ export function getActiveLicenseInfo() {
 }
 
 /**
- * Khởi chạy bảo vệ bản quyền:
- * - Kiểm tra HWID
- * - Đọc license.json hoặc env
- * - Kích hoạt nếu chưa kích hoạt
- * - Verify bản quyền
- * - Thiết lập heartbeat định kỳ 24h
+ * Khởi chạy kiểm tra và bảo vệ bản quyền
  */
 export async function enforceLicenseProtection({ dataDir, forcedKey, forcedAppId }) {
   console.log('\n======================================================');
-  console.log('🔒 ĐANG KIỂM TRA BẢN QUYỀN HỆ THỐNG (LICENSEHUB)...');
+  console.log('🔒 ĐANG KIỂM TRA BẢN QUYỀN HỆ THỐNG...');
   console.log('======================================================');
 
   const hwid = getHardwareId();
@@ -251,29 +345,29 @@ export async function enforceLicenseProtection({ dataDir, forcedKey, forcedAppId
     console.error(`👉 Vui lòng tạo file "${licenseFile}" với nội dung:`);
     console.error(`   {\n     "app_id": "${appId}",\n     "license_key": "KEY-CỦA-BẠN"\n   }`);
     console.error(`👉 Hoặc đặt biến môi trường: export LICENSE_KEY="KEY-CỦA-BẠN"`);
-    console.error(`👉 Hoặc chạy với cờ: ./gomdon-server --activate --key="KEY-CỦA-BẠN"\n`);
+    console.error(`👉 Hoặc kích hoạt bằng lệnh: node server.js --activate --key="KEY-CỦA-BẠN"\n`);
     process.exit(1);
   }
 
-  console.log(`🔑 License Key:                ${licenseKey.slice(0, 8)}****${licenseKey.slice(-4)}`);
+  console.log(`🔑 License Key:                ${licenseKey.slice(0, 8)}****${licenseKey.slice(-6)}`);
 
   // Nếu file license đã có thông tin kích hoạt trùng với HWID hiện tại
   let isAlreadyActivated = saved.license_key === licenseKey && saved.hwid === hwid && saved.status === 'active';
 
   if (!isAlreadyActivated) {
-    console.log('⚡ Đang gửi yêu cầu kích hoạt bản quyền tới LicenseHub...');
+    console.log('⚡ Đang xác thực và kích hoạt bản quyền...');
     const actResult = await activateLicense({
       appId,
       licenseKey,
       hwid,
-      deviceName: `${os.hostname()} (Ubuntu Server)`
+      deviceName: `${os.hostname()} (Server)`
     });
 
     if (!actResult.success) {
       console.error('\n❌ [KÍCH HOẠT THẤT BẠI]:');
       console.error(`   ${actResult.message}`);
       console.error(`   Trạng thái: ${actResult.status}`);
-      console.error('👉 Vui lòng kiểm tra lại Key trên hệ thống https://licensehub.shop\n');
+      console.error('👉 Vui lòng liên hệ nhà phát hành để được cấp License Key hợp lệ.\n');
       process.exit(1);
     }
 
@@ -285,14 +379,13 @@ export async function enforceLicenseProtection({ dataDir, forcedKey, forcedAppId
       hwid: hwid,
       status: 'active',
       activated_at: new Date().toISOString(),
+      customer_name: actResult.customer_name || 'Khách hàng',
       expires_at: actResult.expires_at || null
     };
     saveLicenseConfig(licenseFile, updatedConfig);
-    isAlreadyActivated = true;
   }
 
-  // Verify lại với máy chủ
-  console.log('🔍 Đang xác thực tính hợp lệ của bản quyền...');
+  // Xác thực lại tính toàn vẹn
   const verifyResult = await verifyLicense({ appId, licenseKey, hwid });
 
   if (!verifyResult.valid) {
@@ -306,14 +399,15 @@ export async function enforceLicenseProtection({ dataDir, forcedKey, forcedAppId
     ? new Date(verifyResult.expires_at).toLocaleString('vi-VN')
     : 'Vĩnh viễn (Lifetime)';
 
-  console.log(`✅ Bản quyền HỢP LỆ! Khách hàng: ${verifyResult.customer_name || 'Doanh nghiệp'}`);
+  console.log(`✅ Bản quyền HỢP LỆ!`);
+  console.log(`👤 Khách hàng:         ${verifyResult.customer_name || 'Doanh nghiệp'}`);
   console.log(`⏳ Hạn sử dụng:        ${expText}`);
   console.log('======================================================\n');
 
   activeLicenseInfo = {
     valid: true,
     appId,
-    licenseKey: `${licenseKey.slice(0, 4)}****${licenseKey.slice(-4)}`,
+    licenseKey: `${licenseKey.slice(0, 8)}****${licenseKey.slice(-6)}`,
     hwid,
     expiresAt: verifyResult.expires_at,
     expiresText: expText,
@@ -321,22 +415,19 @@ export async function enforceLicenseProtection({ dataDir, forcedKey, forcedAppId
     lastVerifiedAt: new Date().toISOString()
   };
 
-  // 3. Kiểm tra định kỳ (Heartbeat mỗi 24 giờ)
-  const HEARTBEAT_INTERVAL = 24 * 60 * 60 * 1000; // 24 giờ
+  // Kiểm tra định kỳ mỗi 24 giờ
+  const HEARTBEAT_INTERVAL = 24 * 60 * 60 * 1000;
   setInterval(async () => {
-    console.log('[LicenseHub] Đang thực hiện kiểm tra bản quyền định kỳ 24h...');
     const check = await verifyLicense({ appId, licenseKey, hwid });
     if (!check.valid) {
-      console.error('\n🚨 [CẢNH BÁO BẢN QUYỀN]: Key đã bị thu hồi hoặc hết hạn!');
+      console.error('\n🚨 [CẢNH BÁO BẢN QUYỀN]: Key đã hết hạn hoặc bị thu hồi!');
       console.error(`Lý do: ${check.message}`);
-      console.error('Ứng dụng sẽ tự động dừng lại ngay lập tức.');
       process.exit(1);
     }
     if (activeLicenseInfo) {
       activeLicenseInfo.lastVerifiedAt = new Date().toISOString();
       activeLicenseInfo.expiresAt = check.expires_at;
     }
-    console.log(`[LicenseHub] Bản quyền hợp lệ. Lần kiểm tra tiếp theo sau 24h.`);
   }, HEARTBEAT_INTERVAL);
 
   return activeLicenseInfo;

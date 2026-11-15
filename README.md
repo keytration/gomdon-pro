@@ -241,5 +241,6 @@ pm2 restart gomdon-pro
 
 ## 📞 Hỗ trợ & Bản quyền
 
-- Bản quyền phần mềm được phát hành và bảo vệ bởi **LicenseHub**.
+- Phần mềm được bảo vệ bằng hệ thống **Bản quyền Offline Chữ ký số RSA 2048-bit** độc lập.
+- Khách hàng khi cài đặt chỉ cần cung cấp mã định danh máy chủ (Hardware ID - HWID) hoặc nhận mã License Key từ quản trị viên.
 - Để được cấp mã bản quyền hoặc hỗ trợ kỹ thuật triển khai, vui lòng liên hệ quản trị viên hệ thống.
