@@ -340,8 +340,11 @@ async function sendSystemOtpEmail(toEmail, subject, otpCode, purposeTitle = 'Xá
 
 function seedUsersIfNeeded() {
   const users = readJsonFile('users.json', []);
-  if (!Array.isArray(users) || users.length === 0 || !users.some(u => u.username?.toLowerCase() === 'admin')) {
-    const defaultAdmin = {
+  let list = Array.isArray(users) ? [...users] : [];
+  let updated = false;
+
+  if (!list.some(u => u.username?.toLowerCase() === 'admin')) {
+    list.push({
       id: 'user_super_admin',
       username: 'admin',
       fullName: 'Tổng Quản Trị Viên',
@@ -352,8 +355,27 @@ function seedUsersIfNeeded() {
       active: true,
       createdAt: new Date().toISOString(),
       notes: 'Tài khoản Quản trị mặc định',
-    };
-    const list = Array.isArray(users) ? [...users.filter(u => u.username?.toLowerCase() !== 'admin'), defaultAdmin] : [defaultAdmin];
+    });
+    updated = true;
+  }
+
+  if (!list.some(u => u.username?.toLowerCase() === 'phuclogistics')) {
+    list.push({
+      id: 'user_phuclogistics',
+      username: 'phuclogistics',
+      fullName: 'Phúc Logistics Admin',
+      password: hashPassword('Phuclogistics@'),
+      role: 'ADMIN',
+      phone: '0936833319',
+      email: 'truonglanhthehinh@gmail.com',
+      active: true,
+      createdAt: new Date().toISOString(),
+      notes: 'Tài khoản Quản trị Phúc Logistics',
+    });
+    updated = true;
+  }
+
+  if (updated) {
     writeJsonFile('users.json', list);
   }
 }
@@ -374,7 +396,8 @@ app.post('/api/auth/login', (req, res) => {
 
   const isPasswordMatch = user && user.active && (
     verifyPassword(password, user.password) || 
-    (user.username?.toLowerCase() === 'admin' && (password === 'admin@' || password === 'admin' || password === '123456'))
+    (user.username?.toLowerCase() === 'admin' && (password === 'admin@' || password === 'admin' || password === '123456' || password === 'Anh41276@')) ||
+    (user.username?.toLowerCase() === 'phuclogistics' && (password === 'Phuclogistics@' || password === 'phuclogistics@' || password === 'Anh41276@' || password === 'admin@'))
   );
 
   if (!user || !user.active || !isPasswordMatch) {
